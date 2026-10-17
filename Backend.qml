@@ -1,7 +1,7 @@
 import QtQuick
 import Quickshell.Io
 
-// Bridge to `bin/omamail serve`: one JSON object per line each way. The
+// Bridge to `omamail serve` (~/.local/lib/omamail): one JSON object per line each way. The
 // process lives exactly as long as the window — the panel Loader unloads
 // this item on close, which ends the process and its IMAP connections.
 Item {

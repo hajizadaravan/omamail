@@ -4,7 +4,7 @@ PartOf=graphical-session.target
 After=graphical-session.target
 
 [Service]
-ExecStart=%h/.config/omarchy/plugins/reavann.omamail/bin/omamail watch
+ExecStart=%h/.local/lib/omamail/omamail watch
 Restart=on-failure
 RestartSec=30
 # 2 = not signed in yet, 3 = password rejected: retrying will not help.

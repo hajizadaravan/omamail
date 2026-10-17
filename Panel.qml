@@ -1,6 +1,7 @@
 import QtQuick
 import QtQuick.Controls
 import Quickshell
+import Quickshell.Io
 import qs.Commons
 import qs.Ui
 import "Format.js" as Fmt
@@ -48,8 +49,28 @@ Item {
   }
 
   // ---- state ---------------------------------------------------------------
+  // Built by install.sh outside the plugin's git checkout (see there).
+  readonly property string backendPath: Quickshell.env("HOME") + "/.local/lib/omamail/omamail"
+  readonly property string installScript: decodeURIComponent(String(Qt.resolvedUrl("install.sh")).replace(/^file:\/\//, ""))
+  property bool backendReady: false
+
+  // `omarchy plugin add` only clones; the backend is built by install.sh.
+  // Without it, say so instead of restarting a missing binary forever.
+  Process {
+    command: ["test", "-x", mailApp.backendPath]
+    running: true
+    onExited: function(code) {
+      if (code === 0) {
+        mailApp.backendReady = true
+        mailApp.start()
+      } else {
+        mailApp.phase = "setup"
+      }
+    }
+  }
+
   property Backend backend: Backend {
-    binary: decodeURIComponent(String(Qt.resolvedUrl("bin/omamail")).replace(/^file:\/\//, ""))
+    binary: mailApp.backendReady ? mailApp.backendPath : ""
     onChanged: function(folder) { mailApp.onServerChange(folder) }
     onFailed: function(message) { mailApp.flash(message) }
   }
@@ -642,7 +663,6 @@ Item {
     onTriggered: mailApp.loadFolders()
   }
 
-  Component.onCompleted: start()
 
   // ---- window --------------------------------------------------------------
   FloatingWindow {
@@ -687,6 +707,37 @@ Item {
         color: Qt.darker(Color.foreground, 1.6)
         font.family: Style.font.family
         font.pixelSize: Style.font.display
+      }
+
+      Column {
+        anchors.centerIn: parent
+        width: Math.min(parent.width - Style.space(40), Style.space(520))
+        visible: mailApp.phase === "setup"
+        spacing: Style.space(12)
+
+        Text {
+          textFormat: Text.PlainText
+          text: "One more step"
+          color: Color.foreground
+          font.family: Style.font.family
+          font.pixelSize: Style.font.display
+          font.bold: true
+        }
+        Text {
+          textFormat: Text.PlainText
+          width: parent.width
+          wrapMode: Text.WordWrap
+          text: "The mail backend has not been built yet. Run this in a terminal (it needs Rust: omarchy install dev-env rust), then open Omamail again:"
+          color: Qt.darker(Color.foreground, 1.4)
+          font.family: Style.font.family
+          font.pixelSize: Style.font.bodySmall
+        }
+        TextField {
+          width: parent.width
+          readOnly: true
+          selectByMouse: true
+          text: mailApp.installScript
+        }
       }
 
       Loader {

@@ -1,4 +1,9 @@
-<p align="center"><img src="share/omamail.svg" width="96" alt="Omamail"></p>
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="share/logo-white.svg">
+    <img src="share/logo-black.svg" width="96" alt="Omamail">
+  </picture>
+</p>
 
 # Omamail
 
@@ -16,22 +21,45 @@ A light Gmail client that lives inside the [Omarchy](https://omarchy.org) shell.
 
 ## Install
 
-Needs Rust (`cargo`), `secret-tool` (libsecret) with a running keyring, and
-`zenity` for the attachment picker.
+Omamail is an Omarchy shell plugin. Add it like any other plugin, then
+build its backend once:
 
 ```bash
-./install.sh
+omarchy plugin add https://github.com/reav4nn/omamail.git --enable
+~/.config/omarchy/plugins/reavann.omamail/install.sh
 ```
 
-This builds the backend, links `plugin/` to
-`~/.config/omarchy/plugins/reavann.omamail`, installs a launcher entry and
-the `omamail-watch` user service, and enables the plugin.
+`omarchy plugin add` only clones the repo; `install.sh` builds the Rust
+backend into `~/.local/lib/omamail/` and installs the launcher entry, the icon and the
+`omamail-watch` notification service. It needs Rust
+(`omarchy install dev-env rust`), plus `secret-tool` with a running keyring
+and `zenity`, which Omarchy ships.
 
 Open it from the app launcher ("Omamail"), or bind a key in
 `~/.config/hypr/bindings.lua` to:
 
 ```bash
 omarchy-shell shell toggle reavann.omamail '{}'
+```
+
+To update (the update shows a diff first; look over changes to `backend/`
+and `install.sh` before accepting, since `install.sh` builds that code):
+
+```bash
+omarchy plugin update reavann.omamail
+~/.config/omarchy/plugins/reavann.omamail/install.sh
+omarchy restart shell
+```
+
+To remove:
+
+```bash
+systemctl --user disable --now omamail-watch.service
+omarchy plugin remove reavann.omamail
+rm -rf ~/.local/lib/omamail ~/.config/omamail ~/.cache/omamail ~/.local/state/omamail
+rm ~/.config/systemd/user/omamail-watch.service ~/.local/share/applications/omamail.desktop \
+   ~/.local/share/icons/hicolor/scalable/apps/omamail.svg
+secret-tool clear application omamail
 ```
 
 ### Signing in
@@ -79,10 +107,17 @@ and server names live in `~/.config/omamail/config.json`.
 ## Development
 
 ```
+manifest.json, Panel.qml, Backend.qml, Format.js, components/
+           the QML panel plugin (Panel.qml is the entry point)
 backend/   Rust: IMAP/SMTP, MIME, sanitizer, JSON-lines server, watcher
-plugin/    QML panel plugin (Panel.qml is the entry point)
-share/     launcher entry and user service unit
+share/     launcher entry, icon, logo and user service unit
 ```
+
+Working from a checkout elsewhere, `./install.sh` builds the backend and
+copies the plugin files (without `.git`) into
+`~/.config/omarchy/plugins/reavann.omamail`; run it again after each change.
+It never links the checkout there: `omarchy plugin update` would treat a
+linked checkout as its own and may reset it.
 
 ```bash
 cd backend && cargo test     # unit tests
@@ -90,8 +125,7 @@ cd backend && cargo test     # unit tests
 omarchy restart shell        # pick up QML changes
 ```
 
-The shell caches compiled QML, and its file watcher does not follow the
-plugin symlink, so QML edits need a shell restart to show up.
+The shell caches compiled QML, so QML edits need a shell restart to show up.
 
 The backend speaks one JSON object per line on stdio
 (`{"id":1,"cmd":"list","folder":"INBOX","before_uid":0}`); see `backend/src/server.rs`.
