@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Omamail
+Comment=Gmail in the Omarchy shell
+Exec=omarchy-shell shell summon reavann.omamail {}
+Icon=omamail
+Categories=Network;Email;
+Terminal=false

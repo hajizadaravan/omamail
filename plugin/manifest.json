@@ -1,0 +1,15 @@
+{
+  "schemaVersion": 1,
+  "id": "reavann.omamail",
+  "name": "Omamail",
+  "version": "0.1.0",
+  "author": "Ravan Hajizada",
+  "license": "MIT",
+  "description": "A light Gmail client in the Omarchy shell. Open with: omarchy-shell shell toggle reavann.omamail '{}'",
+  "kinds": [
+    "panel"
+  ],
+  "entryPoints": {
+    "panel": "Panel.qml"
+  }
+}

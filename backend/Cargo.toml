@@ -1,0 +1,26 @@
+[package]
+name = "omamail"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+ammonia = "4"
+base64 = "0.22"
+imagesize = "0.14"
+imap = "2.4"
+lettre = { version = "0.11", default-features = false, features = ["smtp-transport", "native-tls", "builder", "hostname"] }
+libc = "0.2.191"
+mail-parser = "0.11"
+mime_guess = "2"
+native-tls = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+ureq = { version = "3", default-features = false, features = ["native-tls"] }
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
