@@ -1,3 +1,5 @@
+pragma ComponentBehavior: Bound
+
 import QtQuick
 import QtQuick.Controls
 import Quickshell.Io
@@ -14,11 +16,11 @@ Item {
 
   property var files: []
   property bool includeOriginals: true
-  property bool showCopies: draft.cc.length > 0
+  property bool showCopies: root.draft.cc.length > 0
   readonly property color muted: Qt.darker(Color.foreground, 1.4)
-  readonly property bool dirty: toField.text !== draft.to || ccField.text !== draft.cc
-    || bccField.text.length > 0 || subjectField.text !== draft.subject
-    || bodyArea.text !== draft.body || files.length > 0
+  readonly property bool dirty: toField.text !== root.draft.to || ccField.text !== root.draft.cc
+    || bccField.text.length > 0 || subjectField.text !== root.draft.subject
+    || bodyArea.text !== root.draft.body || files.length > 0
 
   function focusFirst() {
     if (toField.text.length === 0) toField.forceActiveFocus()
@@ -29,7 +31,7 @@ Item {
   }
 
   function send() {
-    var forwarding = draft.forward_uid > 0 && includeOriginals
+    var forwarding = root.draft.forward_uid > 0 && includeOriginals
     root.app.sendDraft({
       to: toField.text,
       cc: ccField.text,
@@ -37,10 +39,10 @@ Item {
       subject: subjectField.text,
       body: bodyArea.text,
       files: files,
-      in_reply_to: draft.in_reply_to,
-      references: draft.references,
-      forward_folder: forwarding ? draft.forward_folder : "",
-      forward_uid: forwarding ? draft.forward_uid : 0
+      in_reply_to: root.draft.in_reply_to,
+      references: root.draft.references,
+      forward_folder: forwarding ? root.draft.forward_folder : "",
+      forward_uid: forwarding ? root.draft.forward_uid : 0
     })
   }
 
@@ -96,7 +98,7 @@ Item {
 
     Text {
       textFormat: Text.PlainText
-      text: draft.forward_uid > 0 ? "Forward" : (draft.in_reply_to.length > 0 ? "Reply" : "New message")
+      text: root.draft.forward_uid > 0 ? "Forward" : (root.draft.in_reply_to.length > 0 ? "Reply" : "New message")
       color: Color.foreground
       font.family: Style.font.family
       font.pixelSize: Style.font.heading
@@ -110,7 +112,7 @@ Item {
         id: toField
         width: parent.width - copiesButton.width - parent.spacing
         placeholderText: "To"
-        text: draft.to
+        text: root.draft.to
         KeyNavigation.tab: root.showCopies ? ccField : subjectField
       }
       Button {
@@ -126,7 +128,7 @@ Item {
       visible: root.showCopies
       width: parent.width
       placeholderText: "Cc"
-      text: draft.cc
+      text: root.draft.cc
       KeyNavigation.tab: bccField
     }
 
@@ -142,7 +144,7 @@ Item {
       id: subjectField
       width: parent.width
       placeholderText: "Subject"
-      text: draft.subject
+      text: root.draft.subject
       KeyNavigation.tab: bodyArea
     }
   }
@@ -161,7 +163,7 @@ Item {
 
     TextArea {
       id: bodyArea
-      text: draft.body
+      text: root.draft.body
       wrapMode: TextArea.Wrap
       textFormat: TextEdit.PlainText
       color: Color.foreground
@@ -191,12 +193,12 @@ Item {
     Flow {
       width: parent.width
       spacing: Style.space(6)
-      visible: root.files.length > 0 || (draft.forward_uid > 0 && draft.attachments.length > 0)
+      visible: root.files.length > 0 || (root.draft.forward_uid > 0 && root.draft.attachments.length > 0)
 
       Button {
-        visible: draft.forward_uid > 0 && draft.attachments.length > 0
+        visible: root.draft.forward_uid > 0 && root.draft.attachments.length > 0
         iconText: Fmt.icons.attachment
-        text: draft.attachments.length + " original attachment" + (draft.attachments.length > 1 ? "s" : "")
+        text: root.draft.attachments.length + " original attachment" + (root.draft.attachments.length > 1 ? "s" : "")
         selected: root.includeOriginals
         tooltipText: root.includeOriginals ? "Included. Click to leave out" : "Left out. Click to include"
         onClicked: root.includeOriginals = !root.includeOriginals

@@ -32,8 +32,8 @@ omarchy plugin add https://github.com/reav4nn/omamail.git --enable
 `omarchy plugin add` only clones the repo; `install.sh` builds the Rust
 backend into `~/.local/lib/omamail/` and installs the launcher entry, the icon and the
 `omamail-watch` notification service. It needs Rust
-(`omarchy install dev-env rust`), plus `secret-tool` with a running keyring
-and `zenity`, which Omarchy ships.
+(`omarchy install dev-env rust`); attaching files needs `zenity`
+(`omarchy pkg add zenity`). See [Requirements and permissions](#requirements-and-permissions).
 
 Open it from the app launcher ("Omamail"), or bind a key in
 `~/.config/hypr/bindings.lua` to:
@@ -68,6 +68,33 @@ Omamail uses a Gmail **app password**: turn on 2-Step Verification, then
 create one at <https://myaccount.google.com/apppasswords>. The password is
 stored in the desktop keyring (`secret-tool`), never in a file; the address
 and server names live in `~/.config/omamail/config.json`.
+
+## Requirements and permissions
+
+What Omamail needs, and everything it touches outside the plugin folder:
+
+- **Build**: Rust (`cargo`). `install.sh` builds `backend/` with `--locked`;
+  build output goes to `~/.cache/omamail/target`.
+- **Runtime**: `secret-tool` with a running keyring (gnome-keyring),
+  `notify-send` and `xdg-open`, which Omarchy ships, and `zenity` for the
+  attachment picker, which it does not: `omarchy pkg add zenity`.
+- **Network**: `imap.gmail.com:993` and `smtp.gmail.com:465` over TLS. Remote
+  images are fetched only after you press *Load images*, and only from public
+  addresses; like in any mail client, the sender's server then sees your IP,
+  and `http://` images travel unencrypted.
+- **Files**: the backend binary in `~/.local/lib/omamail/`; account settings
+  in `~/.config/omamail/`; image cache in `~/.cache/omamail/`; watcher state in
+  `~/.local/state/omamail/`; saved attachments in `$XDG_DOWNLOAD_DIR` or
+  `~/Downloads`. A launcher entry and icon go to `~/.local/share/`, the unit
+  file to `~/.config/systemd/user/omamail-watch.service`.
+- **Services**: one systemd user unit, `omamail-watch.service`, which keeps an
+  IMAP IDLE connection open for new-mail notifications. No root and no sudo;
+  besides enabling the plugin, nothing in your existing configuration changes.
+- **Secrets**: the Gmail app password lives only in the keyring; it never
+  goes to argv, a file or a log.
+- **Signing out** removes the password from the keyring and the account
+  settings; cached images and the watcher state stay until you remove them
+  (see *To remove* above).
 
 ## Keys
 

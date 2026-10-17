@@ -56,4 +56,8 @@ if ! omarchy plugin enable reavann.omamail >/dev/null; then
   echo "Could not enable the plugin yet; run: omarchy plugin enable reavann.omamail" >&2
 fi
 
+if ! command -v zenity >/dev/null; then
+  echo "Note: attaching files needs zenity: omarchy pkg add zenity" >&2
+fi
+
 echo "Omamail installed. Open it from the app launcher, or with: omarchy-shell shell toggle reavann.omamail '{}'"
