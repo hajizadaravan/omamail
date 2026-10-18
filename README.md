@@ -86,7 +86,7 @@ What Omamail needs, and everything it touches outside the plugin folder:
 - **Build**: Rust (`cargo`). `install.sh` builds `backend/` with `--locked`;
   build output goes to `~/.cache/omamail/target`.
 - **Runtime**: `secret-tool` with a running keyring (gnome-keyring),
-  `notify-send`, `wl-copy` and `xdg-open`, which Omarchy ships, and `zenity` for the
+  `wl-copy` and `xdg-open`, which Omarchy ships, and `zenity` for the
   attachment picker, which it does not: `omarchy pkg add zenity`.
 - **Network**: `imap.gmail.com:993` and `smtp.gmail.com:465` over TLS. Remote
   images are fetched only after you press *Load images*, and only from public
@@ -101,9 +101,12 @@ What Omamail needs, and everything it touches outside the plugin folder:
   IMAP IDLE connection open for new-mail notifications. No root and no sudo;
   besides enabling the plugin, nothing in your existing configuration changes.
 - **Secrets**: the Gmail app password lives only in the keyring; it never
-  goes to argv, a file or a log.
-- **Signing out** removes the password from the keyring and the account
-  settings; cached images and the watcher state stay until you remove them
+  goes to argv, a file or a log. Notifications are sent straight to
+  `org.freedesktop.Notifications` over the session D-Bus socket and
+  verification codes are piped to `wl-copy`, so mail senders, subjects and
+  codes never appear in process arguments.
+- **Signing out** removes the password from the keyring, the account
+  settings and the watcher state; cached images stay until you remove them
   (see *To remove* above).
 
 ## Keys

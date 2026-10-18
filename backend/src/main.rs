@@ -19,6 +19,7 @@ fn main() {
     match std::env::args().nth(1).as_deref() {
         Some("serve") => server::run(),
         Some("watch") => std::process::exit(watch::run()),
+        Some("copy") => std::process::exit(watch::copy(std::env::args().nth(2).as_deref())),
         Some("--version") => println!("omamail {}", env!("CARGO_PKG_VERSION")),
         _ => {
             eprintln!("usage: omamail serve   # backend for the Omamail window (JSON lines on stdio)");

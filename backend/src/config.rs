@@ -101,12 +101,15 @@ pub fn save_account(account: &Account) -> std::io::Result<()> {
 
 pub fn remove_account() {
     let _ = fs::remove_file(account_file());
+    let _ = fs::remove_file(state_dir().join("watch.json"));
 }
 
 /// Atomic write, readable only by the user.
 pub fn write_private(path: &Path, data: &[u8]) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+        fs::DirBuilder::new().recursive(true).mode(0o700).create(parent)?;
+        fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?;
     }
     // Unique per writer: two threads may cache the same image at once.
     static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);

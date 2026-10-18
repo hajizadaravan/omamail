@@ -147,12 +147,12 @@ impl Server {
             }),
             "login" => self.login(req),
             "logout" => {
+                watcher("stop");
                 if let Some(s) = &self.session {
                     secret::clear(&s.account.email);
                 }
                 self.end_session();
                 config::remove_account();
-                watcher("stop");
                 Ok(Value::Null)
             }
             "folders" => self.session().and_then(|s| Ok(json!(s.mailbox.folders(true)?))),
@@ -353,8 +353,13 @@ fn viewable_mime(mime: &str) -> bool {
 
 /// Best effort: the notification service is optional and may not be installed.
 fn watcher(action: &str) {
-    let _ = Command::new("systemctl")
-        .args(["--user", "--no-block", action, "omamail-watch.service"])
+    let mut cmd = Command::new("systemctl");
+    cmd.arg("--user");
+    if action != "stop" {
+        cmd.arg("--no-block");
+    }
+    let _ = cmd
+        .args([action, "omamail-watch.service"])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
