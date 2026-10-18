@@ -635,6 +635,21 @@ impl Mailbox {
         })
     }
 
+    /// The first 64 KB of a message, without marking it read: enough to
+    /// read a verification code out of a notification-sized mail.
+    pub fn fetch_preview(&mut self, path: &str, uid: u32) -> MailResult<Vec<u8>> {
+        self.run(|mb| {
+            mb.select(path, false)?;
+            let fetches = mb.session()?.uid_fetch(uid.to_string(), "(UID BODY.PEEK[]<0.65536>)")?;
+            fetches
+                .iter()
+                .find(|f| f.uid == Some(uid))
+                .and_then(|f| f.body())
+                .map(<[u8]>::to_vec)
+                .ok_or(MailError::Gone)
+        })
+    }
+
     pub fn set_flag(&mut self, path: &str, uids: &[u32], flag: &str, on: bool) -> MailResult<()> {
         let flag = match flag {
             "seen" => "\\Seen",

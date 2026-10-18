@@ -2,6 +2,7 @@ mod config;
 mod images;
 mod mailbox;
 mod message;
+mod otp;
 mod sanitize;
 mod secret;
 mod send;

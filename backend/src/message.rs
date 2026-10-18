@@ -189,6 +189,11 @@ fn extract_inline_images(msg: &Message, html: &str, referenced: &mut Vec<String>
     map
 }
 
+/// Plain text of the body (HTML converted), for reading codes out of it.
+pub fn plain_text(raw: &[u8]) -> String {
+    parse(raw).and_then(|m| m.body_text(0).map(|t| t.into_owned())).unwrap_or_default()
+}
+
 /// (file name, bytes) of the attachment at `index` in `render`'s numbering.
 pub fn attachment(raw: &[u8], index: usize) -> Option<(String, Vec<u8>)> {
     let msg = parse(raw)?;

@@ -8,6 +8,8 @@
 
 use crate::config::{self, state_dir};
 use crate::mailbox::{MailError, Mailbox, Summary};
+use crate::message;
+use crate::otp;
 use crate::secret;
 use serde::{Deserialize, Serialize};
 use std::process::{Command, Stdio};
@@ -77,8 +79,73 @@ fn notify(summary: String, body: String, open_uid: Option<u32>) {
     });
 }
 
-fn announce(new: &[Summary]) {
-    let unread: Vec<&Summary> = new.iter().filter(|s| !s.seen).collect();
+/// A notification whose click copies `code` instead of opening the mail.
+/// The command rides in Omarchy's `omarchy-exec-argv` hint, so the click
+/// still works after a shell restart; the code is ASCII letters and digits
+/// only and travels as an argument, never as shell text.
+fn notify_code(sender: String, domain: &str, subject: &str, code: &str) {
+    // --sensitive keeps the code out of Omarchy's clipboard history, and the
+    // confirmation does not repeat it into the notification history.
+    let script = "printf %s \"$1\" | wl-copy --sensitive && notify-send -a omarchy-action -t 2000 'Code copied'";
+    let argv = serde_json::json!(["sh", "-c", script, "omamail-copy", code]).to_string();
+    // The display name is the sender's to choose ("Your Bank"); the domain
+    // shows where the mail really came from.
+    let body = format!("<b>{code}</b>  ·  click to copy\n{}  ·  {}", markup_escape(domain), markup_escape(subject));
+    std::thread::spawn(move || {
+        let _ = Command::new("notify-send")
+            .args(["-a", "Omamail", "-h", &format!("string:omarchy-glyph:{GLYPH}")])
+            .args(["-h", &format!("string:omarchy-exec-argv:{argv}")])
+            .args(["--", &sender, &body])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    });
+}
+
+/// Most mail states its code in the subject. Otherwise the start of the
+/// body is read (without marking it read), but only when the subject reads
+/// like a verification mail, and at most MAX_PREVIEWS times per batch: a
+/// burst after a resume must not turn into dozens of fetches.
+fn code_of(mailbox: &mut Mailbox, s: &Summary, previews: &mut usize) -> Option<String> {
+    if let Some(code) = otp::find_code(&s.subject, "") {
+        return Some(code);
+    }
+    if *previews == 0 || !otp::has_keyword(&s.subject) {
+        return None;
+    }
+    *previews -= 1;
+    match mailbox.fetch_preview(INBOX, s.uid) {
+        Ok(raw) => otp::find_code(&s.subject, &message::plain_text(&raw)),
+        Err(_) => {
+            *previews = 0; // the connection is struggling; stop trying
+            None
+        }
+    }
+}
+
+const MAX_PREVIEWS: usize = 3;
+
+fn announce(mailbox: &mut Mailbox, new: &[Summary]) {
+    let mut unread: Vec<&Summary> = new.iter().filter(|s| !s.seen).collect();
+    let mut with_code: Vec<(&Summary, String)> = Vec::new();
+    let mut previews = MAX_PREVIEWS;
+    unread.retain(|s| {
+        if with_code.len() >= 3 {
+            return true;
+        }
+        match code_of(mailbox, s, &mut previews) {
+            Some(code) => {
+                with_code.push((s, code));
+                false
+            }
+            None => true,
+        }
+    });
+    for (s, code) in with_code {
+        let domain = s.from.first().and_then(|p| p.email.rsplit_once('@')).map(|(_, d)| d.to_string()).unwrap_or_default();
+        notify_code(sender(s), &domain, &s.subject, &code);
+    }
     match unread.as_slice() {
         [] => {}
         [one] => notify(sender(one), markup_escape(&one.subject), Some(one.uid)),
@@ -107,7 +174,7 @@ fn check(mailbox: &mut Mailbox, state: &mut State, email: &str) -> Result<(), Ma
     if let Some(max) = new.iter().map(|s| s.uid).max() {
         state.last_uid = max;
         save_state(state);
-        announce(&new);
+        announce(mailbox, &new);
     }
     Ok(())
 }

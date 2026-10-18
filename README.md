@@ -9,6 +9,10 @@
 
 A light Gmail client that lives inside the [Omarchy](https://omarchy.org) shell.
 
+![Omamail in the Omarchy shell, following the current theme](share/screenshots/omamail.png)
+
+<sub>Shown with sample mail.</sub>
+
 - **UI**: a QML panel plugin for `omarchy-shell`. It uses the shell's own
   components and theme tokens, so it follows the current Omarchy theme,
   font and rounding. Nothing runs while the window is closed: the shell
@@ -18,6 +22,12 @@ A light Gmail client that lives inside the [Omarchy](https://omarchy.org) shell.
 - **Notifications**: `omamail watch` runs as a user service, sits in IMAP
   IDLE on the inbox and posts a desktop notification per new message.
   Clicking it opens the message.
+- **Verification codes**: when a new mail carries a one-time code ("295092 is
+  your code", "Doğrulama kodunuz: 123 456"), the notification shows the code
+  and clicking it copies the code to the clipboard instead. Codes are read
+  from the subject, or from the body when the subject reads like a
+  verification mail. The copy is marked sensitive, so it stays out of the
+  clipboard history; the code does show in Omarchy's notification history.
 
 ## Install
 
@@ -76,7 +86,7 @@ What Omamail needs, and everything it touches outside the plugin folder:
 - **Build**: Rust (`cargo`). `install.sh` builds `backend/` with `--locked`;
   build output goes to `~/.cache/omamail/target`.
 - **Runtime**: `secret-tool` with a running keyring (gnome-keyring),
-  `notify-send` and `xdg-open`, which Omarchy ships, and `zenity` for the
+  `notify-send`, `wl-copy` and `xdg-open`, which Omarchy ships, and `zenity` for the
   attachment picker, which it does not: `omarchy pkg add zenity`.
 - **Network**: `imap.gmail.com:993` and `smtp.gmail.com:465` over TLS. Remote
   images are fetched only after you press *Load images*, and only from public
