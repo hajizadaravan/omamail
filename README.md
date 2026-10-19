@@ -28,6 +28,10 @@ A light Gmail client that lives inside the [Omarchy](https://omarchy.org) shell.
   from the subject, or from the body when the subject reads like a
   verification mail. The copy is marked sensitive, so it stays out of the
   clipboard history; the code does show in Omarchy's notification history.
+- **Updates**: once a day a user timer checks the plugin's git checkout for
+  new commits and, when there are some, posts a notification listing them.
+  Clicking it opens a terminal that shows the diff and installs only what
+  you accept. Nothing is installed without you.
 
 ## Install
 
@@ -52,22 +56,32 @@ Open it from the app launcher ("Omamail"), or bind a key in
 omarchy-shell shell toggle reavann.omamail '{}'
 ```
 
-To update (the update shows a diff first; look over changes to `backend/`
-and `install.sh` before accepting, since `install.sh` builds that code):
+To update, click the "update available" notification, or run:
 
 ```bash
-omarchy plugin update reavann.omamail
-~/.config/omarchy/plugins/reavann.omamail/install.sh
-omarchy restart shell
+~/.config/omarchy/plugins/reavann.omamail/update.sh
 ```
+
+It runs `omarchy plugin update`, which shows the diff first: look over
+changes to `backend/` and `install.sh` before accepting, since `install.sh`
+builds that code. Only after you accept does it rebuild (`install.sh`) and
+restart the shell. The daily check itself only fetches, into
+`~/.cache/omamail/update.git`, never into the plugin folder; to turn it off:
+
+```bash
+systemctl --user disable --now omamail-update-check.timer
+```
+
+`install.sh` enables the timer only once, so it stays off.
 
 To remove:
 
 ```bash
-systemctl --user disable --now omamail-watch.service
+systemctl --user disable --now omamail-watch.service omamail-update-check.timer
 omarchy plugin remove reavann.omamail
 rm -rf ~/.local/lib/omamail ~/.config/omamail ~/.cache/omamail ~/.local/state/omamail
-rm ~/.config/systemd/user/omamail-watch.service ~/.local/share/applications/omamail.desktop \
+rm ~/.config/systemd/user/omamail-watch.service ~/.config/systemd/user/omamail-update-check.{service,timer} \
+   ~/.local/share/applications/omamail.desktop \
    ~/.local/share/icons/hicolor/scalable/apps/omamail.svg
 secret-tool clear application omamail
 ```
@@ -91,14 +105,17 @@ What Omamail needs, and everything it touches outside the plugin folder:
 - **Network**: `imap.gmail.com:993` and `smtp.gmail.com:465` over TLS. Remote
   images are fetched only after you press *Load images*, and only from public
   addresses; like in any mail client, the sender's server then sees your IP,
-  and `http://` images travel unencrypted.
+  and `http://` images travel unencrypted. Once a day the update check runs
+  `git fetch` against the plugin's remote (GitHub).
 - **Files**: the backend binary in `~/.local/lib/omamail/`; account settings
-  in `~/.config/omamail/`; image cache in `~/.cache/omamail/`; watcher state in
-  `~/.local/state/omamail/`; saved attachments in `$XDG_DOWNLOAD_DIR` or
+  in `~/.config/omamail/`; image cache and the update check's git cache in `~/.cache/omamail/`; watcher and
+  update-check state in `~/.local/state/omamail/`; saved attachments in `$XDG_DOWNLOAD_DIR` or
   `~/Downloads`. A launcher entry and icon go to `~/.local/share/`, the unit
-  file to `~/.config/systemd/user/omamail-watch.service`.
-- **Services**: one systemd user unit, `omamail-watch.service`, which keeps an
-  IMAP IDLE connection open for new-mail notifications. No root and no sudo;
+  files to `~/.config/systemd/user/` (`omamail-watch.service`,
+  `omamail-update-check.service` and `.timer`).
+- **Services**: `omamail-watch.service`, a systemd user unit that keeps an
+  IMAP IDLE connection open for new-mail notifications, and
+  `omamail-update-check.timer`, which runs the daily update check. No root and no sudo;
   besides enabling the plugin, nothing in your existing configuration changes.
 - **Secrets**: the Gmail app password lives only in the keyring; it never
   goes to argv, a file or a log. Notifications are sent straight to
@@ -150,7 +167,9 @@ What Omamail needs, and everything it touches outside the plugin folder:
 manifest.json, Panel.qml, Backend.qml, Format.js, components/
            the QML panel plugin (Panel.qml is the entry point)
 backend/   Rust: IMAP/SMTP, MIME, sanitizer, JSON-lines server, watcher
-share/     launcher entry, icon, logo and user service unit
+share/     launcher entry, icon, logo, user service and timer units
+install.sh, update.sh
+           build + install; update (diff, then install.sh)
 ```
 
 Working from a checkout elsewhere, `./install.sh` builds the backend and

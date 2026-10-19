@@ -5,6 +5,9 @@
 #             swap in a binary; only a rebuild you run changes it.
 #   launcher  ~/.local/share/applications/omamail.desktop + icon
 #   service   ~/.config/systemd/user/omamail-watch.service (new-mail notifications)
+#   timer     ~/.config/systemd/user/omamail-update-check.{service,timer}: a
+#             daily check that notifies when the plugin has updates. It only
+#             fetches; installing still goes through update.sh and its diff.
 #
 # Run it from the plugin folder after `omarchy plugin add`, and again after
 # `omarchy plugin update reavann.omamail`. Run from a checkout elsewhere, it
@@ -42,12 +45,20 @@ fi
 install -Dm644 "$root/share/omamail.desktop" "$HOME/.local/share/applications/omamail.desktop"
 install -Dm644 "$root/share/omamail.svg" "$HOME/.local/share/icons/hicolor/scalable/apps/omamail.svg"
 install -Dm644 "$root/share/omamail-watch.service" "$HOME/.config/systemd/user/omamail-watch.service"
+install -Dm644 "$root/share/omamail-update-check.service" "$HOME/.config/systemd/user/omamail-update-check.service"
+install -Dm644 "$root/share/omamail-update-check.timer" "$HOME/.config/systemd/user/omamail-update-check.timer"
+# The update timer is enabled once; the marker keeps a timer you disabled
+# disabled on later runs.
+timer_marker="${XDG_STATE_HOME:-$HOME/.local/state}/omamail/update-timer-enabled"
 if systemctl --user daemon-reload 2>/dev/null; then
   systemctl --user enable omamail-watch.service >/dev/null
   # Starts now if an account is already signed in; otherwise signing in starts it.
   systemctl --user restart omamail-watch.service || true
+  if [[ ! -e $timer_marker ]] && systemctl --user enable --now omamail-update-check.timer >/dev/null; then
+    install -Dm600 /dev/null "$timer_marker"
+  fi
 else
-  echo "No user session bus: run 'systemctl --user enable --now omamail-watch.service' from your desktop session." >&2
+  echo "No user session bus: run 'systemctl --user enable --now omamail-watch.service omamail-update-check.timer' from your desktop session." >&2
 fi
 
 omarchy-shell shell rescanPlugins >/dev/null 2>&1 || true

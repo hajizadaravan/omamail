@@ -24,9 +24,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-const PLUGIN_ID: &str = "reavann.omamail";
+pub(crate) const PLUGIN_ID: &str = "reavann.omamail";
 const INBOX: &str = "INBOX";
-const GLYPH: &str = "\u{f01ee}"; // nf-md-email
+pub(crate) const GLYPH: &str = "\u{f01ee}"; // nf-md-email
 const CODE_TTL_SECS: u64 = 30 * 60;
 const MAX_STORED_CODES: usize = 10;
 
@@ -91,7 +91,7 @@ fn save_state(state: &State) {
 }
 
 /// Notification bodies are rendered as markup by the Omarchy shell.
-fn markup_escape(text: &str) -> String {
+pub(crate) fn markup_escape(text: &str) -> String {
     text.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
 }
 
@@ -393,7 +393,7 @@ fn send_notification_to(
     read_reply(&mut stream)
 }
 
-fn send_notification(
+pub(crate) fn send_notification(
     app: &str,
     summary: &str,
     body_text: &str,

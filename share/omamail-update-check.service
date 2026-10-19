@@ -1,0 +1,12 @@
+[Unit]
+Description=Check for Omamail updates
+# A boot-time run can fail before the network is up: retry a few times.
+StartLimitIntervalSec=6h
+StartLimitBurst=5
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/lib/omamail/omamail update-check
+TimeoutStartSec=2min
+Restart=on-failure
+RestartSec=30min

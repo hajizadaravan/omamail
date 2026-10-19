@@ -7,6 +7,7 @@ mod sanitize;
 mod secret;
 mod send;
 mod server;
+mod update;
 mod utf7;
 mod watch;
 
@@ -19,11 +20,13 @@ fn main() {
     match std::env::args().nth(1).as_deref() {
         Some("serve") => server::run(),
         Some("watch") => std::process::exit(watch::run()),
+        Some("update-check") => std::process::exit(update::check()),
         Some("copy") => std::process::exit(watch::copy(std::env::args().nth(2).as_deref())),
         Some("--version") => println!("omamail {}", env!("CARGO_PKG_VERSION")),
         _ => {
             eprintln!("usage: omamail serve   # backend for the Omamail window (JSON lines on stdio)");
             eprintln!("       omamail watch   # new-mail notifications (run as a user service)");
+            eprintln!("       omamail update-check   # notify when the plugin has updates (run by a user timer)");
             std::process::exit(2);
         }
     }
