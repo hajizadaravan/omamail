@@ -679,16 +679,21 @@ impl Mailbox {
             mb.arrived = false;
             mb.select(path, true)?;
             let mut messages = Vec::new();
-            if let Some((_, last_uid)) = since.filter(|(validity, _)| *validity == mb.uidvalidity)
-                // UIDNEXT 0: the server did not say; look anyway.
-                && (mb.uidnext == 0 || mb.uidnext - 1 > last_uid)
-            {
+            // Fetched even when UIDNEXT says nothing is new: it costs one
+            // round trip, and a UIDNEXT that lags behind would hide new mail.
+            if let Some((_, last_uid)) = since.filter(|(validity, _)| *validity == mb.uidvalidity) {
                 let fetches = mb.session()?.uid_fetch(format!("{}:*", last_uid.saturating_add(1)), HEADER_FETCH)?;
                 // `N:*` always matches the highest UID, even when it is below
                 // N, and imap 2.4 mixes unsolicited FETCH responses (flag
-                // changes on older mail) into the result.
-                messages = fetches.iter().filter_map(summary).filter(|m| m.uid > last_uid).collect();
+                // changes, without headers) into the result.
+                messages = fetches
+                    .iter()
+                    .filter(|f| f.header().is_some())
+                    .filter_map(summary)
+                    .filter(|m| m.uid > last_uid)
+                    .collect();
                 messages.sort_by_key(|m| m.uid);
+                messages.dedup_by_key(|m| m.uid);
             }
             Ok(NewMail { uidvalidity: mb.uidvalidity, uidnext: mb.uidnext, messages })
         })

@@ -118,8 +118,24 @@ fn notify(summary: String, body: String, open_uid: Option<u32>) {
     };
     let argv = serde_json::json!(["omarchy-shell", "shell", "summon", PLUGIN_ID, payload]).to_string();
     let hints = vec![("omarchy-glyph".to_string(), GLYPH.to_string()), ("omarchy-exec-argv".to_string(), argv)];
+    post(summary, body, hints);
+}
+
+/// Waits between attempts to post a notification while nobody shows them
+/// (the shell restarting): about half a minute in all.
+const NOTIFY_RETRIES: [u64; 5] = [1, 2, 4, 8, 15];
+
+/// Posts a notification from its own thread. It is sent again only when it
+/// surely did not reach the screen, so it never shows twice.
+fn post(summary: String, body: String, hints: Vec<(String, String)>) {
     std::thread::spawn(move || {
-        let _ = send_notification("Omamail", &summary, &body, &hints, -1);
+        for wait in std::iter::once(0).chain(NOTIFY_RETRIES) {
+            std::thread::sleep(Duration::from_secs(wait));
+            match send_notification_to(&session_bus_path(), "Omamail", &summary, &body, &hints, -1) {
+                Err((_, true)) => continue,
+                _ => return,
+            }
+        }
     });
 }
 
@@ -137,9 +153,7 @@ fn notify_code(sender: String, domain: &str, subject: &str, code: &str, uid: u32
         markup_escape(subject)
     );
     let hints = vec![("omarchy-glyph".to_string(), GLYPH.to_string()), ("omarchy-exec-argv".to_string(), argv)];
-    std::thread::spawn(move || {
-        let _ = send_notification("Omamail", &sender, &body, &hints, -1);
-    });
+    post(sender, body, hints);
 }
 
 /// `omamail copy <uid>`: invoked by clicking a verification-code notification.
@@ -331,7 +345,9 @@ fn sasl_auth(stream: &mut UnixStream) -> std::io::Result<()> {
     stream.write_all(b"BEGIN\r\n")
 }
 
-fn read_reply(stream: &mut UnixStream) -> std::io::Result<()> {
+/// Reads up to the reply to our call: true for a method return, false for
+/// an error reply.
+fn read_reply(stream: &mut UnixStream) -> std::io::Result<bool> {
     for _ in 0..8 {
         let mut head = [0u8; 16];
         stream.read_exact(&mut head)?;
@@ -355,14 +371,17 @@ fn read_reply(stream: &mut UnixStream) -> std::io::Result<()> {
         let mut buf = vec![0u8; rest];
         stream.read_exact(&mut buf)?;
         match msg_type {
-            2 => return Ok(()),
-            3 => return Err(std::io::Error::other("dbus error reply")),
+            2 => return Ok(true),
+            3 => return Ok(false),
             _ => continue,
         }
     }
     Err(std::io::Error::other("no dbus method return"))
 }
 
+/// The error carries whether the notification surely was not shown: the
+/// failure came before Notify went out, or the bus answered it with an error
+/// (no notification daemon yet). After a lost reply it may be on screen.
 fn send_notification_to(
     socket: &Path,
     app: &str,
@@ -370,15 +389,19 @@ fn send_notification_to(
     body_text: &str,
     hints: &[(String, String)],
     timeout: i32,
-) -> std::io::Result<()> {
-    let mut stream = UnixStream::connect(socket)?;
+) -> Result<(), (std::io::Error, bool)> {
+    let unsent = |e: std::io::Error| (e, true);
+    let error_reply = || std::io::Error::other("dbus error reply");
+    let mut stream = UnixStream::connect(socket).map_err(unsent)?;
     let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
     let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
-    sasl_auth(&mut stream)?;
+    sasl_auth(&mut stream).map_err(unsent)?;
 
     let hello = dbus_call(1, "org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus", "Hello", "", &[]);
-    stream.write_all(&hello)?;
-    read_reply(&mut stream)?;
+    stream.write_all(&hello).map_err(unsent)?;
+    if !read_reply(&mut stream).map_err(unsent)? {
+        return Err((error_reply(), true));
+    }
 
     let body = notify_body(app, summary, body_text, hints, timeout);
     let notify = dbus_call(
@@ -390,8 +413,12 @@ fn send_notification_to(
         "susssasa{sv}i",
         &body,
     );
-    stream.write_all(&notify)?;
-    read_reply(&mut stream)
+    stream.write_all(&notify).map_err(|e| (e, false))?;
+    match read_reply(&mut stream) {
+        Ok(true) => Ok(()),
+        Ok(false) => Err((error_reply(), true)),
+        Err(e) => Err((e, false)),
+    }
 }
 
 pub(crate) fn send_notification(
@@ -401,7 +428,7 @@ pub(crate) fn send_notification(
     hints: &[(String, String)],
     timeout: i32,
 ) -> std::io::Result<()> {
-    send_notification_to(&session_bus_path(), app, summary, body_text, hints, timeout)
+    send_notification_to(&session_bus_path(), app, summary, body_text, hints, timeout).map_err(|(e, _)| e)
 }
 
 // ---- watcher loop --------------------------------------------------------
@@ -623,6 +650,41 @@ mod tests {
         assert_eq!(s.codes.len(), MAX_STORED_CODES);
         assert_eq!(s.code_for(0, 5000), None);
         assert_eq!(s.code_for(14, 5000).as_deref(), Some("000014"));
+    }
+
+    #[test]
+    fn retries_only_notifications_that_surely_were_not_shown() {
+        let missing = std::env::temp_dir().join(format!("omamail-nobus-{}.sock", std::process::id()));
+        assert!(matches!(send_notification_to(&missing, "Omamail", "s", "b", &[], -1), Err((_, true))));
+
+        // The bus takes Notify and then goes silent: it may be on screen.
+        let sock = std::env::temp_dir().join(format!("omamail-mute-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&sock);
+        let listener = UnixListener::bind(&sock).unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut conn, _) = listener.accept().unwrap();
+            let mut seen = Vec::new();
+            let mut b = [0u8; 1];
+            while !seen.ends_with(b"BEGIN\r\n") {
+                conn.read_exact(&mut b).unwrap();
+                seen.push(b[0]);
+                if seen.ends_with(b"\r\n") && !seen.ends_with(b"BEGIN\r\n") {
+                    conn.write_all(b"OK 0123456789abcdef0123456789abcdef\r\n").unwrap();
+                }
+            }
+            let mut head = [0u8; 16];
+            conn.read_exact(&mut head).unwrap();
+            let fields_len = u32::from_le_bytes([head[12], head[13], head[14], head[15]]) as usize;
+            let rest = ((16 + fields_len + 7) & !7) - 16;
+            conn.read_exact(&mut vec![0u8; rest]).unwrap();
+            conn.write_all(&[b'l', 2, 1, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0]).unwrap();
+            // Swallow Notify, never answer; hang up after the client gives up.
+            let _ = conn.read_to_end(&mut Vec::new());
+        });
+        let result = send_notification_to(&sock, "Omamail", "s", "b", &[], -1);
+        assert!(matches!(result, Err((_, false))));
+        let _ = server.join();
+        let _ = std::fs::remove_file(&sock);
     }
 
     #[test]
