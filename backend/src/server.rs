@@ -8,6 +8,7 @@
 //! connection; a second connection sits in IDLE on INBOX to push changes.
 
 use crate::config::{self, Account};
+use crate::liveness;
 use crate::mailbox::{MailError, Mailbox};
 use crate::message;
 use crate::secret;
@@ -19,9 +20,11 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const PAGE_SIZE: u32 = 50;
+const IDLE_TIMEOUT: Duration = Duration::from_secs(9 * 60);
+const AUTH_RETRY: Duration = Duration::from_secs(10 * 60);
 const RAW_CACHE: usize = 6;
 
 #[derive(Clone)]
@@ -388,24 +391,45 @@ fn write_unique(dir: &std::path::Path, name: &str, bytes: &[u8]) -> std::io::Res
     Err(std::io::Error::other("too many files with that name"))
 }
 
+/// Pushes "changed" for INBOX to the window. Each round looks at INBOX (one
+/// SELECT) and then waits in IDLE. A refresh is sent after a wake (which may
+/// be a flag change made elsewhere) or when the counts moved since the last
+/// look: mail that arrived while not in IDLE, at startup or across a
+/// reconnect, is caught that way. The first round always refreshes once.
 fn spawn_idle(account: Account, password: String, out: Out, stop: Arc<AtomicBool>) {
     std::thread::spawn(move || {
         let mut mailbox = Mailbox::new(account, password);
-        let mut backoff = 5;
+        let mut backoff = liveness::Backoff::new(120);
+        let mut seen: Option<(u32, u32)> = None;
+        let mut woke = true;
         while !stop.load(Ordering::Relaxed) {
-            match mailbox.wait_for_change("INBOX", Duration::from_secs(9 * 60)) {
+            let kicks = liveness::kicks();
+            let started = Instant::now();
+            let result = mailbox.counts("INBOX").and_then(|now| {
+                if (woke || seen != Some(now)) && !stop.load(Ordering::Relaxed) {
+                    out.emit(&json!({"event": "changed", "folder": "INBOX"}));
+                }
+                seen = Some(now);
+                mailbox.idle(IDLE_TIMEOUT)
+            });
+            match result {
                 Ok(changed) => {
-                    backoff = 5;
-                    if changed && !stop.load(Ordering::Relaxed) {
-                        // Let a burst of EXISTS/FETCH lines settle into one refresh.
-                        std::thread::sleep(Duration::from_millis(800));
-                        out.emit(&json!({"event": "changed", "folder": "INBOX"}));
+                    woke = changed;
+                    if let Some(wait) = backoff.after_round(started.elapsed()) {
+                        liveness::sleep(wait, kicks);
                     }
                 }
-                Err(MailError::Auth) => return,
-                Err(_) => {
-                    std::thread::sleep(Duration::from_secs(backoff));
-                    backoff = (backoff * 2).min(120);
+                // The worker's requests report a rejected login to the window;
+                // here, keep trying now and then in case it passes.
+                Err(MailError::Auth) => {
+                    liveness::sleep(AUTH_RETRY, kicks);
+                }
+                Err(e) => {
+                    // Changes may have been missed while disconnected.
+                    woke = true;
+                    if liveness::sleep(backoff.next(e.is_offline()), kicks) {
+                        backoff.reset();
+                    }
                 }
             }
         }
@@ -414,6 +438,7 @@ fn spawn_idle(account: Account, password: String, out: Out, stop: Arc<AtomicBool
 }
 
 pub fn run() {
+    liveness::start();
     let out = Out(Arc::new(Mutex::new(std::io::stdout())));
     let (tx, rx) = mpsc::channel::<Value>();
     let worker_out = out.clone();

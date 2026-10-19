@@ -1,5 +1,6 @@
 mod config;
 mod images;
+mod liveness;
 mod mailbox;
 mod message;
 mod otp;

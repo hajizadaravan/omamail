@@ -12,6 +12,7 @@
 //! codes never appear in `/proc/<pid>/cmdline`.
 
 use crate::config::{self, state_dir};
+use crate::liveness;
 use crate::mailbox::{MailError, Mailbox, Summary};
 use crate::message;
 use crate::otp;
@@ -22,7 +23,7 @@ use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub(crate) const PLUGIN_ID: &str = "reavann.omamail";
 const INBOX: &str = "INBOX";
@@ -405,57 +406,26 @@ pub(crate) fn send_notification(
 
 // ---- watcher loop --------------------------------------------------------
 
-/// Most mail states its code in the subject. Otherwise the start of the
-/// body is read (without marking it read), but only when the subject reads
-/// like a verification mail, and at most MAX_PREVIEWS times per batch: a
-/// burst after a resume must not turn into dozens of fetches.
-fn code_of(mailbox: &mut Mailbox, s: &Summary, previews: &mut usize) -> Option<String> {
-    if let Some(code) = otp::find_code(&s.subject, "") {
-        return Some(code);
-    }
-    if *previews == 0 || !otp::has_keyword(&s.subject) {
-        return None;
-    }
-    *previews -= 1;
-    match mailbox.fetch_preview(INBOX, s.uid) {
-        Ok(raw) => otp::find_code(&s.subject, &message::plain_text(&raw)),
-        Err(_) => {
-            *previews = 0; // the connection is struggling; stop trying
-            None
-        }
-    }
+const IDLE_TIMEOUT: Duration = Duration::from_secs(9 * 60);
+/// At most this many body previews per batch: a burst after a resume must not
+/// turn into dozens of fetches.
+const MAX_PREVIEWS: usize = 3;
+const MAX_CODE_NOTIFICATIONS: usize = 3;
+/// Retries of a keyring that is not unlocked yet at login.
+const KEYRING_TRIES: u32 = 24;
+const KEYRING_RETRY: Duration = Duration::from_secs(5);
+/// A login refused after earlier ones worked is retried, slowly, for about a
+/// day (see `run`).
+const AUTH_RETRY_FIRST: Duration = Duration::from_secs(10 * 60);
+const AUTH_RETRY_MAX: Duration = Duration::from_secs(60 * 60);
+const AUTH_RETRIES: u32 = 30;
+
+fn domain_of(s: &Summary) -> String {
+    s.from.first().and_then(|p| p.email.rsplit_once('@')).map(|(_, d)| d.to_string()).unwrap_or_default()
 }
 
-const MAX_PREVIEWS: usize = 3;
-
-fn announce(mailbox: &mut Mailbox, state: &mut State, new: &[Summary]) {
-    let mut unread: Vec<&Summary> = new.iter().filter(|s| !s.seen).collect();
-    let mut with_code: Vec<(&Summary, String)> = Vec::new();
-    let mut previews = MAX_PREVIEWS;
-    unread.retain(|s| {
-        if with_code.len() >= 3 {
-            return true;
-        }
-        match code_of(mailbox, s, &mut previews) {
-            Some(code) => {
-                with_code.push((s, code));
-                false
-            }
-            None => true,
-        }
-    });
-    if !with_code.is_empty() {
-        let now = now_secs();
-        for (s, code) in &with_code {
-            state.remember_code(s.uid, code.clone(), now);
-        }
-        save_state(state);
-    }
-    for (s, code) in with_code {
-        let domain = s.from.first().and_then(|p| p.email.rsplit_once('@')).map(|(_, d)| d.to_string()).unwrap_or_default();
-        notify_code(sender(s), &domain, &s.subject, &code, s.uid);
-    }
-    match unread.as_slice() {
+fn notify_plain(mail: &[&Summary]) {
+    match mail {
         [] => {}
         [one] => notify(sender(one), markup_escape(&one.subject), Some(one.uid)),
         many => {
@@ -466,30 +436,98 @@ fn announce(mailbox: &mut Mailbox, state: &mut State, new: &[Summary]) {
     }
 }
 
+/// Codes go to the 0600 state file before their notification: clicking it
+/// reads the code from there.
+fn notify_codes(state: &mut State, found: &[(&Summary, String)]) {
+    if found.is_empty() {
+        return;
+    }
+    let now = now_secs();
+    for (s, code) in found {
+        state.remember_code(s.uid, code.clone(), now);
+    }
+    save_state(state);
+    for (s, code) in found {
+        notify_code(sender(s), &domain_of(s), &s.subject, code, s.uid);
+    }
+}
+
+/// Most mail states its code in the subject. Otherwise the start of the body
+/// is read (without marking it read), but only when the subject reads like a
+/// verification mail. Everything that needs no body is announced first, so
+/// a slow preview never holds back ordinary mail.
+fn announce(mailbox: &mut Mailbox, state: &mut State, new: &[Summary]) {
+    let mut with_code: Vec<(&Summary, String)> = Vec::new();
+    let mut candidates: Vec<&Summary> = Vec::new();
+    let mut plain: Vec<&Summary> = Vec::new();
+    for s in new.iter().filter(|s| !s.seen) {
+        let room = with_code.len() + candidates.len() < MAX_CODE_NOTIFICATIONS;
+        match otp::find_code(&s.subject, "") {
+            Some(code) if room => with_code.push((s, code)),
+            None if room && candidates.len() < MAX_PREVIEWS && otp::has_keyword(&s.subject) => candidates.push(s),
+            _ => plain.push(s),
+        }
+    }
+    notify_codes(state, &with_code);
+    notify_plain(&plain);
+    if candidates.is_empty() {
+        return;
+    }
+    let uids: Vec<u32> = candidates.iter().map(|s| s.uid).collect();
+    let previews = mailbox.fetch_previews(INBOX, &uids).unwrap_or_default();
+    let mut found = Vec::new();
+    let mut without = Vec::new();
+    for s in candidates {
+        let body = previews.iter().find(|(uid, _)| *uid == s.uid).map(|(_, raw)| message::plain_text(raw));
+        match body.and_then(|text| otp::find_code(&s.subject, &text)) {
+            Some(code) => found.push((s, code)),
+            None => without.push(s),
+        }
+    }
+    notify_codes(state, &found);
+    notify_plain(&without);
+}
+
 fn check(mailbox: &mut Mailbox, state: &mut State, email: &str) -> Result<(), MailError> {
     if state.prune_codes(now_secs()) {
         save_state(state);
     }
-    let (validity, next) = mailbox.uid_status(INBOX)?;
-    if validity != state.uidvalidity || state.last_uid == 0 || state.email != email {
+    let baseline = (state.email == email && state.uidvalidity != 0).then_some((state.uidvalidity, state.last_uid));
+    let new = mailbox.poll_new(INBOX, baseline)?;
+    if baseline.is_none() || new.uidvalidity != state.uidvalidity {
         // First run, or the server renumbered the folder: start from now.
         state.email = email.to_string();
-        state.uidvalidity = validity;
-        state.last_uid = next.saturating_sub(1);
+        state.uidvalidity = new.uidvalidity;
+        state.last_uid = new.uidnext.saturating_sub(1);
         state.codes.clear();
         save_state(state);
         return Ok(());
     }
-    if next.saturating_sub(1) <= state.last_uid {
-        return Ok(());
-    }
-    let new = mailbox.new_since(INBOX, state.last_uid)?;
-    if let Some(max) = new.iter().map(|s| s.uid).max() {
-        state.last_uid = max;
+    // Every UID below the SELECT's UIDNEXT existed then and was just fetched
+    // (or had already left the inbox): none of them needs looking at again.
+    let newest = new.messages.iter().map(|s| s.uid).max().unwrap_or(0);
+    let last_uid = state.last_uid.max(newest).max(new.uidnext.saturating_sub(1));
+    if last_uid != state.last_uid {
+        state.last_uid = last_uid;
         save_state(state);
-        announce(mailbox, state, &new);
+    }
+    if !new.messages.is_empty() {
+        announce(mailbox, state, &new.messages);
     }
     Ok(())
+}
+
+/// The keyring may still be locked right after login: give it a while.
+fn keyring_password(email: &str) -> Option<String> {
+    for attempt in 1..=KEYRING_TRIES {
+        if let Some(password) = secret::lookup(email) {
+            return Some(password);
+        }
+        if attempt < KEYRING_TRIES {
+            std::thread::sleep(KEYRING_RETRY);
+        }
+    }
+    None
 }
 
 pub fn run() -> i32 {
@@ -497,27 +535,53 @@ pub fn run() -> i32 {
         eprintln!("omamail watch: no account configured; sign in from the Omamail window first");
         return 2;
     };
-    let Some(password) = secret::lookup(&account.email) else {
+    let Some(password) = keyring_password(&account.email) else {
         eprintln!("omamail watch: no password in the keyring for {}", account.email);
         return 2;
     };
+    liveness::start();
     let email = account.email.clone();
-    let mut mailbox = Mailbox::new(account, password);
+    let mut mailbox = Mailbox::new(account.clone(), password);
     let mut state = load_state();
-    let mut backoff = 5;
+    let mut backoff = liveness::Backoff::new(300);
+    let mut logged_in = false;
+    let mut auth_failures = 0;
     loop {
-        let result = check(&mut mailbox, &mut state, &email)
-            .and_then(|_| mailbox.wait_for_change(INBOX, Duration::from_secs(9 * 60)).map(|_| ()));
+        let kicks = liveness::kicks();
+        let started = Instant::now();
+        let result = check(&mut mailbox, &mut state, &email).and_then(|_| {
+            logged_in = true;
+            auth_failures = 0;
+            mailbox.idle(IDLE_TIMEOUT)
+        });
         match result {
-            Ok(()) => backoff = 5,
-            Err(MailError::Auth) => {
+            Ok(_) => {
+                if let Some(wait) = backoff.after_round(started.elapsed()) {
+                    liveness::sleep(wait, kicks);
+                }
+            }
+            Err(MailError::Auth) if !logged_in || auth_failures >= AUTH_RETRIES => {
                 eprintln!("omamail watch: Gmail rejected the stored app password");
                 return 3;
             }
+            // It worked before: more likely a passing refusal (throttling, a
+            // security check) than a revoked password. Retry slowly, with the
+            // password as the keyring has it now.
+            Err(MailError::Auth) => {
+                auth_failures += 1;
+                let wait = AUTH_RETRY_FIRST.saturating_mul(1 << (auth_failures - 1).min(3)).min(AUTH_RETRY_MAX);
+                eprintln!("omamail watch: Gmail refused the login; retrying in {} min", wait.as_secs() / 60);
+                liveness::sleep(wait, kicks);
+                if let Some(password) = secret::lookup(&email) {
+                    mailbox = Mailbox::new(account.clone(), password);
+                }
+            }
             Err(e) => {
-                eprintln!("omamail watch: {e}; retrying in {backoff}s");
-                std::thread::sleep(Duration::from_secs(backoff));
-                backoff = (backoff * 2).min(300);
+                let wait = backoff.next(e.is_offline());
+                eprintln!("omamail watch: {e}; retrying in {}s", wait.as_secs());
+                if liveness::sleep(wait, kicks) {
+                    backoff.reset();
+                }
             }
         }
     }

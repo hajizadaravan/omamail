@@ -1,27 +1,37 @@
 use crate::config::Account;
+use crate::liveness;
 use crate::utf7;
-use imap::types::{Fetch, Flag, NameAttribute};
+use imap::types::{Fetch, Flag, NameAttribute, UnsolicitedResponse};
 use mail_parser::{Address, MessageParser};
 use native_tls::{TlsConnector, TlsStream};
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::io::{Read, Write};
-use std::net::{TcpStream, ToSocketAddrs};
+use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::time::Duration;
 
 type Session = imap::Session<Stream>;
 
 const HEADER_FETCH: &str = "(UID FLAGS INTERNALDATE BODY.PEEK[HEADER.FIELDS (FROM TO SUBJECT DATE CONTENT-TYPE)])";
 const NETWORK_TIMEOUT: Duration = Duration::from_secs(45);
+/// Ending IDLE: the connection is dropped right after (see `idle`), so the
+/// DONE reply only needs a short wait, and a dead link must not cost 45 s.
+const DONE_TIMEOUT: Duration = Duration::from_secs(5);
+/// Starting IDLE. "+ idling" comes within a round trip, but when an untagged
+/// line ("* 5 EXISTS") arrives first, imap 2.4 reads on until the timeout.
+const IDLE_START_TIMEOUT: Duration = Duration::from_secs(10);
+/// Verification-code previews hold back their notification.
+const PREVIEW_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Sidebar order. Gmail marks its system folders with RFC 6154 special-use
 /// attributes; INBOX is matched by name.
 const ROLE_ORDER: [&str; 7] = ["inbox", "flagged", "sent", "drafts", "all", "junk", "trash"];
 
-/// TLS stream whose read timeout never drops to "block forever": IDLE clears
-/// the timeout on its way out, which would hang the next command on a dead
-/// connection.
+/// TLS stream whose read timeout never drops to "block forever". imap 2.4
+/// clears the timeout only when IDLE ends, right before reading the DONE
+/// reply, and the connection is not reused after IDLE: a short timeout there
+/// bounds that one read.
 pub struct Stream(TlsStream<TcpStream>);
 
 impl Read for Stream {
@@ -43,7 +53,7 @@ impl imap::extensions::idle::SetReadTimeout for Stream {
     fn set_read_timeout(&mut self, timeout: Option<Duration>) -> imap::Result<()> {
         self.0
             .get_ref()
-            .set_read_timeout(timeout.or(Some(NETWORK_TIMEOUT)))
+            .set_read_timeout(timeout.or(Some(DONE_TIMEOUT)))
             .map_err(imap::Error::Io)
     }
 }
@@ -51,6 +61,9 @@ impl imap::extensions::idle::SetReadTimeout for Stream {
 #[derive(Debug)]
 pub enum MailError {
     Auth,
+    /// No connection could be made at all (name lookup, TCP connect): the
+    /// request never reached the server.
+    Offline(String),
     Network(String),
     Server(String),
     Gone,
@@ -62,7 +75,7 @@ impl fmt::Display for MailError {
             MailError::Auth => f.write_str(
                 "Gmail rejected the login. Check the address and that you used a 16-character app password.",
             ),
-            MailError::Network(e) => write!(f, "Network error: {e}"),
+            MailError::Offline(e) | MailError::Network(e) => write!(f, "Network error: {e}"),
             MailError::Server(e) => write!(f, "Server error: {e}"),
             MailError::Gone => f.write_str("The message no longer exists on the server."),
         }
@@ -80,7 +93,11 @@ impl From<imap::Error> for MailError {
 
 impl MailError {
     fn is_connection(&self) -> bool {
-        matches!(self, MailError::Network(_))
+        matches!(self, MailError::Offline(_) | MailError::Network(_))
+    }
+
+    pub fn is_offline(&self) -> bool {
+        matches!(self, MailError::Offline(_))
     }
 }
 
@@ -228,9 +245,28 @@ pub struct Mailbox {
     /// Per-folder sender/subject index for substring search (see `search`).
     indexes: HashMap<String, HeaderIndex>,
     pub exists: u32,
-    /// (folder, EXISTS) seen by the previous IDLE round, to catch mail that
-    /// landed between rounds. Server state, so it survives reconnects.
-    last_exists: Option<(String, u32)>,
+    pub uidnext: u32,
+    /// The server announced new messages (EXISTS) in a reply to some other
+    /// command since the last SELECT: IDLE would not report them again.
+    arrived: bool,
+    /// IDLE starts that failed in a row (see `idle`).
+    idle_start_failures: u32,
+    /// The connection's socket, registered so a resume or network change can
+    /// cut a blocked read short (see liveness.rs).
+    tracked: Option<liveness::Tracked>,
+    /// The address that worked last time, tried first: where IPv6 is
+    /// configured but goes nowhere, every reconnect would wait for it.
+    preferred: Option<SocketAddr>,
+    tls: Option<TlsConnector>,
+    capabilities_known: bool,
+}
+
+/// New mail in a folder, from one SELECT (see `poll_new`).
+pub struct NewMail {
+    pub uidvalidity: u32,
+    pub uidnext: u32,
+    /// Messages with a UID above the given one, oldest first.
+    pub messages: Vec<Summary>,
 }
 
 impl Mailbox {
@@ -245,55 +281,85 @@ impl Mailbox {
             uidvalidity: 0,
             indexes: HashMap::new(),
             exists: 0,
-            last_exists: None,
+            uidnext: 0,
+            arrived: false,
+            idle_start_failures: 0,
+            tracked: None,
+            preferred: None,
+            tls: None,
+            capabilities_known: false,
         }
     }
 
     pub fn connect(&mut self) -> MailResult<()> {
         self.close();
-        let host = self.account.imap_host.as_str();
-        let addrs: Vec<_> = (host, self.account.imap_port)
+        let host = self.account.imap_host.clone();
+        let mut addrs: Vec<SocketAddr> = (host.as_str(), self.account.imap_port)
             .to_socket_addrs()
-            .map_err(|e| MailError::Network(format!("{host}: {e}")))?
+            .map_err(|e| MailError::Offline(format!("{host}: {e}")))?
             .collect();
+        // The address that worked last, then its family, then the rest.
+        let preferred = self.preferred;
+        addrs.sort_by_key(|a| (Some(*a) != preferred, preferred.is_some_and(|p| p.is_ipv4() != a.is_ipv4())));
         // Try every address: a network with broken IPv6 must not cost a
         // full timeout before failing.
-        let mut last = MailError::Network(format!("{host}: no address"));
+        let mut last = MailError::Offline(format!("{host}: no address"));
         let mut tcp = None;
         for addr in &addrs {
             match TcpStream::connect_timeout(addr, Duration::from_secs(10)) {
                 Ok(t) => {
+                    self.preferred = Some(*addr);
                     tcp = Some(t);
                     break;
                 }
-                Err(e) => last = MailError::Network(format!("{host}: {e}")),
+                Err(e) => last = MailError::Offline(format!("{host}: {e}")),
             }
         }
         let tcp = tcp.ok_or(last)?;
         tcp.set_read_timeout(Some(NETWORK_TIMEOUT)).ok();
         tcp.set_write_timeout(Some(NETWORK_TIMEOUT)).ok();
-        let tls = TlsConnector::new().map_err(|e| MailError::Network(e.to_string()))?;
-        let stream = tls.connect(host, tcp).map_err(|e| MailError::Network(e.to_string()))?;
+        liveness::keep_alive(&tcp);
+        self.tracked = liveness::Tracked::new(&tcp);
+        let tls = match &self.tls {
+            Some(tls) => tls.clone(),
+            None => {
+                // Loads the system CA bundle: once per process is enough.
+                let tls = TlsConnector::new().map_err(|e| MailError::Network(e.to_string()))?;
+                self.tls = Some(tls.clone());
+                tls
+            }
+        };
+        let stream = tls.connect(&host, tcp).map_err(|e| MailError::Network(e.to_string()))?;
         let mut client = imap::Client::new(Stream(stream));
         client.read_greeting()?;
         let mut session = client.login(&self.account.email, &self.password).map_err(|(e, _)| match e {
             imap::Error::No(msg) | imap::Error::Bad(msg) if is_auth_failure(&msg) => MailError::Auth,
             other => MailError::from(other),
         })?;
-        let caps = session.capabilities()?;
-        self.capabilities = ["MOVE", "UIDPLUS", "X-GM-EXT-1", "LITERAL+", "LITERAL-"]
-            .into_iter()
-            .filter(|c| caps.has_str(c))
-            .map(String::from)
-            .collect();
+        // The server's capabilities do not change between connections; asking
+        // once saves a round trip on every reconnect.
+        if !self.capabilities_known {
+            let caps = session.capabilities()?;
+            self.capabilities = ["MOVE", "UIDPLUS", "X-GM-EXT-1", "LITERAL+", "LITERAL-"]
+                .into_iter()
+                .filter(|c| caps.has_str(c))
+                .map(String::from)
+                .collect();
+            self.capabilities_known = true;
+        }
         self.session = Some(session);
         Ok(())
     }
 
     pub fn close(&mut self) {
         if let Some(mut s) = self.session.take() {
+            // A polite LOGOUT, but not a long wait on a dead connection.
+            if let Some(t) = &self.tracked {
+                t.set_read_timeout(DONE_TIMEOUT);
+            }
             let _ = s.logout();
         }
+        self.tracked = None;
         self.selected = None;
     }
 
@@ -302,7 +368,19 @@ impl Mailbox {
     /// read as the reply to the next one (imap 2.4 asserts on the tag).
     fn poison(&mut self) {
         self.session = None;
+        self.tracked = None;
         self.selected = None;
+    }
+
+    /// Clears the unsolicited responses collected during the last command,
+    /// remembering whether they announced new messages.
+    fn drain_unsolicited(&mut self) {
+        let Some(s) = self.session.as_mut() else { return };
+        let mut arrived = false;
+        while let Ok(r) = s.unsolicited_responses.try_recv() {
+            arrived |= matches!(r, UnsolicitedResponse::Exists(_) | UnsolicitedResponse::Recent(_));
+        }
+        self.arrived |= arrived;
     }
 
     fn has_capability(&self, name: &str) -> bool {
@@ -325,9 +403,7 @@ impl Mailbox {
         if matches!(result, Err(ref e) if e.is_connection()) {
             self.poison();
         }
-        if let Some(s) = self.session.as_mut() {
-            while s.unsolicited_responses.try_recv().is_ok() {}
-        }
+        self.drain_unsolicited();
         result
     }
 
@@ -431,6 +507,7 @@ impl Mailbox {
         self.selected = None;
         let mailbox = self.session()?.select(path)?;
         self.exists = mailbox.exists;
+        self.uidnext = mailbox.uid_next.unwrap_or(0);
         self.uidvalidity = mailbox.uid_validity.unwrap_or(0);
         self.selected = Some(path.to_string());
         Ok(())
@@ -593,28 +670,37 @@ impl Mailbox {
         Ok(messages)
     }
 
-    /// Headers of messages with UID > `last_uid`, for the new-mail watcher.
-    pub fn new_since(&mut self, path: &str, last_uid: u32) -> MailResult<Vec<Summary>> {
+    /// Selects `path` and fetches the headers of messages with a UID above
+    /// `since.1`, unless `since.0` is not the folder's UIDVALIDITY (the
+    /// numbering changed, or there is no baseline yet). One SELECT answers
+    /// "anything new?" and leaves the connection ready for `idle`.
+    pub fn poll_new(&mut self, path: &str, since: Option<(u32, u32)>) -> MailResult<NewMail> {
         self.run(|mb| {
+            mb.arrived = false;
             mb.select(path, true)?;
-            // `N:*` always matches the highest UID, even when it is below N.
-            let uids: Vec<u32> = mb
-                .session()?
-                .uid_search(format!("UID {}:*", last_uid.saturating_add(1)))?
-                .into_iter()
-                .filter(|u| *u > last_uid)
-                .collect();
-            mb.headers_by_uid(&uids)
+            let mut messages = Vec::new();
+            if let Some((_, last_uid)) = since.filter(|(validity, _)| *validity == mb.uidvalidity)
+                // UIDNEXT 0: the server did not say; look anyway.
+                && (mb.uidnext == 0 || mb.uidnext - 1 > last_uid)
+            {
+                let fetches = mb.session()?.uid_fetch(format!("{}:*", last_uid.saturating_add(1)), HEADER_FETCH)?;
+                // `N:*` always matches the highest UID, even when it is below
+                // N, and imap 2.4 mixes unsolicited FETCH responses (flag
+                // changes on older mail) into the result.
+                messages = fetches.iter().filter_map(summary).filter(|m| m.uid > last_uid).collect();
+                messages.sort_by_key(|m| m.uid);
+            }
+            Ok(NewMail { uidvalidity: mb.uidvalidity, uidnext: mb.uidnext, messages })
         })
     }
 
-    /// (UIDVALIDITY, UIDNEXT) of a folder.
-    pub fn uid_status(&mut self, path: &str) -> MailResult<(u32, u32)> {
+    /// Selects `path` and returns (UIDNEXT, EXISTS): enough to tell whether
+    /// mail arrived or left since the last look, before `idle`.
+    pub fn counts(&mut self, path: &str) -> MailResult<(u32, u32)> {
         self.run(|mb| {
-            let raw = mb
-                .session()?
-                .run_command_and_read_response(format!("STATUS {} (UIDNEXT UIDVALIDITY)", quote(path)?))?;
-            Ok((status_value(&raw, "UIDVALIDITY").unwrap_or(0), status_value(&raw, "UIDNEXT").unwrap_or(1)))
+            mb.arrived = false;
+            mb.select(path, true)?;
+            Ok((mb.uidnext, mb.exists))
         })
     }
 
@@ -635,19 +721,35 @@ impl Mailbox {
         })
     }
 
-    /// The first 64 KB of a message, without marking it read: enough to
-    /// read a verification code out of a notification-sized mail.
-    pub fn fetch_preview(&mut self, path: &str, uid: u32) -> MailResult<Vec<u8>> {
-        self.run(|mb| {
-            mb.select(path, false)?;
-            let fetches = mb.session()?.uid_fetch(uid.to_string(), "(UID BODY.PEEK[]<0.65536>)")?;
-            fetches
-                .iter()
-                .find(|f| f.uid == Some(uid))
-                .and_then(|f| f.body())
-                .map(<[u8]>::to_vec)
-                .ok_or(MailError::Gone)
-        })
+    /// The first 64 KB of each message in the folder `poll_new` selected,
+    /// without marking them read: enough to read a verification code out of a
+    /// notification-sized mail. Notifications wait on this, so a slow reply
+    /// gets PREVIEW_TIMEOUT and no retry.
+    pub fn fetch_previews(&mut self, path: &str, uids: &[u32]) -> MailResult<Vec<(u32, Vec<u8>)>> {
+        let set = uid_set(uids)?;
+        if self.session.is_none() || self.selected.as_deref() != Some(path) {
+            return Err(MailError::Network("folder not selected".into()));
+        }
+        if let Some(t) = &self.tracked {
+            t.set_read_timeout(PREVIEW_TIMEOUT);
+        }
+        let result = self.session()?.uid_fetch(set, "(UID BODY.PEEK[]<0.65536>)").map(|fetches| {
+            fetches.iter().filter_map(|f| Some((f.uid?, f.body()?.to_vec()))).filter(|(uid, _)| uids.contains(uid)).collect()
+        });
+        match result {
+            Ok(previews) => {
+                if let Some(t) = &self.tracked {
+                    t.set_read_timeout(NETWORK_TIMEOUT);
+                }
+                self.drain_unsolicited();
+                Ok(previews)
+            }
+            Err(e) => {
+                // A late reply would be read as the answer to the next command.
+                self.poison();
+                Err(e.into())
+            }
+        }
     }
 
     pub fn set_flag(&mut self, path: &str, uids: &[u32], flag: &str, on: bool) -> MailResult<()> {
@@ -684,35 +786,40 @@ impl Mailbox {
         })
     }
 
-    /// Blocks until the server reports a change in `path` or `timeout` passes.
-    /// Returns true on a change.
-    pub fn wait_for_change(&mut self, path: &str, timeout: Duration) -> MailResult<bool> {
-        let result = self.wait_inner(path, timeout);
-        if matches!(result, Err(ref e) if e.is_connection()) {
-            self.poison();
-        }
-        result
-    }
-
-    fn wait_inner(&mut self, path: &str, timeout: Duration) -> MailResult<bool> {
-        if self.session.is_none() {
-            self.connect()?;
-        }
-        self.select(path, true)?;
-        let previous = self.last_exists.replace((path.to_string(), self.exists));
-        if previous.is_some_and(|(p, n)| p == path && n != self.exists) {
+    /// Waits in IDLE on the folder `poll_new` or `counts` just selected, until
+    /// the server reports a change (true) or `timeout` passes (false). Returns
+    /// true at once when there is nothing to wait on: mail was announced since
+    /// the SELECT, or the connection is gone. The caller then looks again.
+    ///
+    /// No second SELECT between looking and waiting: anything that arrives
+    /// after the SELECT is pushed by the server, either in a reply (`arrived`)
+    /// or during IDLE.
+    pub fn idle(&mut self, timeout: Duration) -> MailResult<bool> {
+        if self.session.is_none() || self.selected.is_none() || std::mem::take(&mut self.arrived) {
             return Ok(true);
         }
-        let outcome = {
-            let mut idle = self.session()?.idle()?;
-            idle.set_keepalive(timeout);
-            idle.wait_with_timeout(timeout)
-        };
+        if let Some(t) = &self.tracked {
+            t.set_read_timeout(IDLE_START_TIMEOUT);
+        }
+        let started = self.session()?.idle().map(|handle| handle.wait_with_timeout(timeout));
         // imap 2.4 sends DONE and reads its reply while dropping the IDLE
         // handle, ignoring errors. If that reply is late, the next command
         // would read it and trip imap's tag assertion, so the connection is
         // never reused after IDLE; the next round starts a fresh one.
         self.poison();
+        let outcome = match started {
+            Ok(outcome) => {
+                self.idle_start_failures = 0;
+                outcome
+            }
+            // Most likely mail arrived just as IDLE started ("* 5 EXISTS"
+            // before "+ idling"): look again right away. Twice in a row is a
+            // real problem and goes through the caller's backoff.
+            Err(e) => {
+                self.idle_start_failures += 1;
+                return if self.idle_start_failures == 1 { Ok(true) } else { Err(e.into()) };
+            }
+        };
         match outcome? {
             imap::extensions::idle::WaitOutcome::MailboxChanged => Ok(true),
             imap::extensions::idle::WaitOutcome::TimedOut => Ok(false),

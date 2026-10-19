@@ -165,14 +165,16 @@ Item {
     })
   }
 
+  // The backend answers in order: the list (or the clicked message) first,
+  // then the folder counts, which take a round trip per label.
   function enterMail() {
     phase = "mail"
     signInError = ""
-    loadFolders()
     var target = pendingTarget
     pendingTarget = null
     if (target) showMessage(target.folder, target.uid, true)
     else selectFolder(folder)
+    loadFolders()
   }
 
   // ---- folders -------------------------------------------------------------
@@ -267,7 +269,8 @@ Item {
 
   // reset: a different folder or query, start empty. Otherwise refresh the
   // newest page and keep older rows that were already loaded below it.
-  function loadList(reset) {
+  // quiet: a background refresh, whose failure is not worth a message.
+  function loadList(reset, quiet) {
     if (reset) {
       messages.clear()
       total = 0
@@ -283,6 +286,7 @@ Item {
       loadingList = false
       runPendingRefresh()
       if (!ok) {
+        if (quiet) return
         listError = data
         return handleError(data, code)
       }
@@ -658,11 +662,16 @@ Item {
     onTriggered: mailApp.status = ""
   }
 
+  // Labels get no push from the server (IDLE watches INBOX only), and a
+  // missed push must not leave the list stale for long either.
   Timer {
     interval: 3 * 60 * 1000
     repeat: true
     running: mailApp.phase === "mail"
-    onTriggered: mailApp.loadFolders()
+    onTriggered: {
+      mailApp.loadFolders()
+      if (mailApp.query.length === 0 && !mailApp.loadingList) mailApp.loadList(false, true)
+    }
   }
 
 
