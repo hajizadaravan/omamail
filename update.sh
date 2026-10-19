@@ -35,7 +35,9 @@
   fi
 
   if ((status != 0)); then
-    echo "The update stopped part-way (see above); not building it. Run it again, or run $plugin_dir/install.sh once it is complete." >&2
+    # Running this again would see no new commits and build nothing.
+    echo "The checkout moved but the update reported an error (see above), so nothing was built." >&2
+    echo "Once it looks right, build and load it with: $plugin_dir/install.sh && omarchy restart shell" >&2
     finish "${1:-}" 1
   fi
   if ! "$plugin_dir/install.sh"; then
