@@ -21,7 +21,11 @@ A light Gmail client that lives inside the [Omarchy](https://omarchy.org) shell.
   reading, SMTP for sending, all over TLS.
 - **Notifications**: `omamail watch` runs as a user service, sits in IMAP
   IDLE on the inbox and posts a desktop notification per new message.
-  Clicking it opens the message.
+  Clicking it opens the message. A connection that died quietly (after a
+  suspend, a Wi-Fi or VPN change, or a router forgetting it) is noticed
+  within seconds of the machine waking or the network changing, and within
+  about a minute otherwise (TCP keepalive); mail that arrived meanwhile is
+  announced as soon as it reconnects.
 - **Verification codes**: when a new mail carries a one-time code ("295092 is
   your code", "Doğrulama kodunuz: 123 456"), the notification shows the code
   and clicking it copies the code to the clipboard instead. Codes are read

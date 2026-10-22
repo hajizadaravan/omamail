@@ -12,6 +12,7 @@
 //! codes never appear in `/proc/<pid>/cmdline`.
 
 use crate::config::{self, state_dir};
+use crate::liveness;
 use crate::mailbox::{MailError, Mailbox, Summary};
 use crate::message;
 use crate::otp;
@@ -22,7 +23,7 @@ use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub(crate) const PLUGIN_ID: &str = "reavann.omamail";
 const INBOX: &str = "INBOX";
@@ -117,8 +118,24 @@ fn notify(summary: String, body: String, open_uid: Option<u32>) {
     };
     let argv = serde_json::json!(["omarchy-shell", "shell", "summon", PLUGIN_ID, payload]).to_string();
     let hints = vec![("omarchy-glyph".to_string(), GLYPH.to_string()), ("omarchy-exec-argv".to_string(), argv)];
+    post(summary, body, hints);
+}
+
+/// Waits between attempts to post a notification while nobody shows them
+/// (the shell restarting): about half a minute in all.
+const NOTIFY_RETRIES: [u64; 5] = [1, 2, 4, 8, 15];
+
+/// Posts a notification from its own thread. It is sent again only when it
+/// surely did not reach the screen, so it never shows twice.
+fn post(summary: String, body: String, hints: Vec<(String, String)>) {
     std::thread::spawn(move || {
-        let _ = send_notification("Omamail", &summary, &body, &hints, -1);
+        for wait in std::iter::once(0).chain(NOTIFY_RETRIES) {
+            std::thread::sleep(Duration::from_secs(wait));
+            match send_notification_to(&session_bus_path(), "Omamail", &summary, &body, &hints, -1) {
+                Err((_, true)) => continue,
+                _ => return,
+            }
+        }
     });
 }
 
@@ -136,9 +153,7 @@ fn notify_code(sender: String, domain: &str, subject: &str, code: &str, uid: u32
         markup_escape(subject)
     );
     let hints = vec![("omarchy-glyph".to_string(), GLYPH.to_string()), ("omarchy-exec-argv".to_string(), argv)];
-    std::thread::spawn(move || {
-        let _ = send_notification("Omamail", &sender, &body, &hints, -1);
-    });
+    post(sender, body, hints);
 }
 
 /// `omamail copy <uid>`: invoked by clicking a verification-code notification.
@@ -330,7 +345,9 @@ fn sasl_auth(stream: &mut UnixStream) -> std::io::Result<()> {
     stream.write_all(b"BEGIN\r\n")
 }
 
-fn read_reply(stream: &mut UnixStream) -> std::io::Result<()> {
+/// Reads up to the reply to our call: true for a method return, false for
+/// an error reply.
+fn read_reply(stream: &mut UnixStream) -> std::io::Result<bool> {
     for _ in 0..8 {
         let mut head = [0u8; 16];
         stream.read_exact(&mut head)?;
@@ -354,14 +371,17 @@ fn read_reply(stream: &mut UnixStream) -> std::io::Result<()> {
         let mut buf = vec![0u8; rest];
         stream.read_exact(&mut buf)?;
         match msg_type {
-            2 => return Ok(()),
-            3 => return Err(std::io::Error::other("dbus error reply")),
+            2 => return Ok(true),
+            3 => return Ok(false),
             _ => continue,
         }
     }
     Err(std::io::Error::other("no dbus method return"))
 }
 
+/// The error carries whether the notification surely was not shown: the
+/// failure came before Notify went out, or the bus answered it with an error
+/// (no notification daemon yet). After a lost reply it may be on screen.
 fn send_notification_to(
     socket: &Path,
     app: &str,
@@ -369,15 +389,19 @@ fn send_notification_to(
     body_text: &str,
     hints: &[(String, String)],
     timeout: i32,
-) -> std::io::Result<()> {
-    let mut stream = UnixStream::connect(socket)?;
+) -> Result<(), (std::io::Error, bool)> {
+    let unsent = |e: std::io::Error| (e, true);
+    let error_reply = || std::io::Error::other("dbus error reply");
+    let mut stream = UnixStream::connect(socket).map_err(unsent)?;
     let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
     let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
-    sasl_auth(&mut stream)?;
+    sasl_auth(&mut stream).map_err(unsent)?;
 
     let hello = dbus_call(1, "org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus", "Hello", "", &[]);
-    stream.write_all(&hello)?;
-    read_reply(&mut stream)?;
+    stream.write_all(&hello).map_err(unsent)?;
+    if !read_reply(&mut stream).map_err(unsent)? {
+        return Err((error_reply(), true));
+    }
 
     let body = notify_body(app, summary, body_text, hints, timeout);
     let notify = dbus_call(
@@ -389,8 +413,12 @@ fn send_notification_to(
         "susssasa{sv}i",
         &body,
     );
-    stream.write_all(&notify)?;
-    read_reply(&mut stream)
+    stream.write_all(&notify).map_err(|e| (e, false))?;
+    match read_reply(&mut stream) {
+        Ok(true) => Ok(()),
+        Ok(false) => Err((error_reply(), true)),
+        Err(e) => Err((e, false)),
+    }
 }
 
 pub(crate) fn send_notification(
@@ -400,62 +428,31 @@ pub(crate) fn send_notification(
     hints: &[(String, String)],
     timeout: i32,
 ) -> std::io::Result<()> {
-    send_notification_to(&session_bus_path(), app, summary, body_text, hints, timeout)
+    send_notification_to(&session_bus_path(), app, summary, body_text, hints, timeout).map_err(|(e, _)| e)
 }
 
 // ---- watcher loop --------------------------------------------------------
 
-/// Most mail states its code in the subject. Otherwise the start of the
-/// body is read (without marking it read), but only when the subject reads
-/// like a verification mail, and at most MAX_PREVIEWS times per batch: a
-/// burst after a resume must not turn into dozens of fetches.
-fn code_of(mailbox: &mut Mailbox, s: &Summary, previews: &mut usize) -> Option<String> {
-    if let Some(code) = otp::find_code(&s.subject, "") {
-        return Some(code);
-    }
-    if *previews == 0 || !otp::has_keyword(&s.subject) {
-        return None;
-    }
-    *previews -= 1;
-    match mailbox.fetch_preview(INBOX, s.uid) {
-        Ok(raw) => otp::find_code(&s.subject, &message::plain_text(&raw)),
-        Err(_) => {
-            *previews = 0; // the connection is struggling; stop trying
-            None
-        }
-    }
+const IDLE_TIMEOUT: Duration = Duration::from_secs(9 * 60);
+/// At most this many body previews per batch: a burst after a resume must not
+/// turn into dozens of fetches.
+const MAX_PREVIEWS: usize = 3;
+const MAX_CODE_NOTIFICATIONS: usize = 3;
+/// Retries of a keyring that is not unlocked yet at login.
+const KEYRING_TRIES: u32 = 24;
+const KEYRING_RETRY: Duration = Duration::from_secs(5);
+/// A login refused after earlier ones worked is retried, slowly, for about a
+/// day (see `run`).
+const AUTH_RETRY_FIRST: Duration = Duration::from_secs(10 * 60);
+const AUTH_RETRY_MAX: Duration = Duration::from_secs(60 * 60);
+const AUTH_RETRIES: u32 = 30;
+
+fn domain_of(s: &Summary) -> String {
+    s.from.first().and_then(|p| p.email.rsplit_once('@')).map(|(_, d)| d.to_string()).unwrap_or_default()
 }
 
-const MAX_PREVIEWS: usize = 3;
-
-fn announce(mailbox: &mut Mailbox, state: &mut State, new: &[Summary]) {
-    let mut unread: Vec<&Summary> = new.iter().filter(|s| !s.seen).collect();
-    let mut with_code: Vec<(&Summary, String)> = Vec::new();
-    let mut previews = MAX_PREVIEWS;
-    unread.retain(|s| {
-        if with_code.len() >= 3 {
-            return true;
-        }
-        match code_of(mailbox, s, &mut previews) {
-            Some(code) => {
-                with_code.push((s, code));
-                false
-            }
-            None => true,
-        }
-    });
-    if !with_code.is_empty() {
-        let now = now_secs();
-        for (s, code) in &with_code {
-            state.remember_code(s.uid, code.clone(), now);
-        }
-        save_state(state);
-    }
-    for (s, code) in with_code {
-        let domain = s.from.first().and_then(|p| p.email.rsplit_once('@')).map(|(_, d)| d.to_string()).unwrap_or_default();
-        notify_code(sender(s), &domain, &s.subject, &code, s.uid);
-    }
-    match unread.as_slice() {
+fn notify_plain(mail: &[&Summary]) {
+    match mail {
         [] => {}
         [one] => notify(sender(one), markup_escape(&one.subject), Some(one.uid)),
         many => {
@@ -466,30 +463,98 @@ fn announce(mailbox: &mut Mailbox, state: &mut State, new: &[Summary]) {
     }
 }
 
+/// Codes go to the 0600 state file before their notification: clicking it
+/// reads the code from there.
+fn notify_codes(state: &mut State, found: &[(&Summary, String)]) {
+    if found.is_empty() {
+        return;
+    }
+    let now = now_secs();
+    for (s, code) in found {
+        state.remember_code(s.uid, code.clone(), now);
+    }
+    save_state(state);
+    for (s, code) in found {
+        notify_code(sender(s), &domain_of(s), &s.subject, code, s.uid);
+    }
+}
+
+/// Most mail states its code in the subject. Otherwise the start of the body
+/// is read (without marking it read), but only when the subject reads like a
+/// verification mail. Everything that needs no body is announced first, so
+/// a slow preview never holds back ordinary mail.
+fn announce(mailbox: &mut Mailbox, state: &mut State, new: &[Summary]) {
+    let mut with_code: Vec<(&Summary, String)> = Vec::new();
+    let mut candidates: Vec<&Summary> = Vec::new();
+    let mut plain: Vec<&Summary> = Vec::new();
+    for s in new.iter().filter(|s| !s.seen) {
+        let room = with_code.len() + candidates.len() < MAX_CODE_NOTIFICATIONS;
+        match otp::find_code(&s.subject, "") {
+            Some(code) if room => with_code.push((s, code)),
+            None if room && candidates.len() < MAX_PREVIEWS && otp::has_keyword(&s.subject) => candidates.push(s),
+            _ => plain.push(s),
+        }
+    }
+    notify_codes(state, &with_code);
+    notify_plain(&plain);
+    if candidates.is_empty() {
+        return;
+    }
+    let uids: Vec<u32> = candidates.iter().map(|s| s.uid).collect();
+    let previews = mailbox.fetch_previews(INBOX, &uids).unwrap_or_default();
+    let mut found = Vec::new();
+    let mut without = Vec::new();
+    for s in candidates {
+        let body = previews.iter().find(|(uid, _)| *uid == s.uid).map(|(_, raw)| message::plain_text(raw));
+        match body.and_then(|text| otp::find_code(&s.subject, &text)) {
+            Some(code) => found.push((s, code)),
+            None => without.push(s),
+        }
+    }
+    notify_codes(state, &found);
+    notify_plain(&without);
+}
+
 fn check(mailbox: &mut Mailbox, state: &mut State, email: &str) -> Result<(), MailError> {
     if state.prune_codes(now_secs()) {
         save_state(state);
     }
-    let (validity, next) = mailbox.uid_status(INBOX)?;
-    if validity != state.uidvalidity || state.last_uid == 0 || state.email != email {
+    let baseline = (state.email == email && state.uidvalidity != 0).then_some((state.uidvalidity, state.last_uid));
+    let new = mailbox.poll_new(INBOX, baseline)?;
+    if baseline.is_none() || new.uidvalidity != state.uidvalidity {
         // First run, or the server renumbered the folder: start from now.
         state.email = email.to_string();
-        state.uidvalidity = validity;
-        state.last_uid = next.saturating_sub(1);
+        state.uidvalidity = new.uidvalidity;
+        state.last_uid = new.uidnext.saturating_sub(1);
         state.codes.clear();
         save_state(state);
         return Ok(());
     }
-    if next.saturating_sub(1) <= state.last_uid {
-        return Ok(());
-    }
-    let new = mailbox.new_since(INBOX, state.last_uid)?;
-    if let Some(max) = new.iter().map(|s| s.uid).max() {
-        state.last_uid = max;
+    // Every UID below the SELECT's UIDNEXT existed then and was just fetched
+    // (or had already left the inbox): none of them needs looking at again.
+    let newest = new.messages.iter().map(|s| s.uid).max().unwrap_or(0);
+    let last_uid = state.last_uid.max(newest).max(new.uidnext.saturating_sub(1));
+    if last_uid != state.last_uid {
+        state.last_uid = last_uid;
         save_state(state);
-        announce(mailbox, state, &new);
+    }
+    if !new.messages.is_empty() {
+        announce(mailbox, state, &new.messages);
     }
     Ok(())
+}
+
+/// The keyring may still be locked right after login: give it a while.
+fn keyring_password(email: &str) -> Option<String> {
+    for attempt in 1..=KEYRING_TRIES {
+        if let Some(password) = secret::lookup(email) {
+            return Some(password);
+        }
+        if attempt < KEYRING_TRIES {
+            std::thread::sleep(KEYRING_RETRY);
+        }
+    }
+    None
 }
 
 pub fn run() -> i32 {
@@ -497,27 +562,54 @@ pub fn run() -> i32 {
         eprintln!("omamail watch: no account configured; sign in from the Omamail window first");
         return 2;
     };
-    let Some(password) = secret::lookup(&account.email) else {
+    let Some(password) = keyring_password(&account.email) else {
         eprintln!("omamail watch: no password in the keyring for {}", account.email);
         return 2;
     };
+    liveness::start();
     let email = account.email.clone();
-    let mut mailbox = Mailbox::new(account, password);
+    let mut mailbox = Mailbox::new(account.clone(), password);
     let mut state = load_state();
-    let mut backoff = 5;
+    let mut backoff = liveness::Backoff::new(300);
+    let mut logged_in = false;
+    let mut auth_failures = 0;
     loop {
-        let result = check(&mut mailbox, &mut state, &email)
-            .and_then(|_| mailbox.wait_for_change(INBOX, Duration::from_secs(9 * 60)).map(|_| ()));
+        let kicks = liveness::kicks();
+        let started = Instant::now();
+        let result = check(&mut mailbox, &mut state, &email).and_then(|_| {
+            logged_in = true;
+            auth_failures = 0;
+            mailbox.idle(IDLE_TIMEOUT)
+        });
         match result {
-            Ok(()) => backoff = 5,
-            Err(MailError::Auth) => {
+            Ok(_) => {
+                if let Some(wait) = backoff.after_round(started.elapsed()) {
+                    liveness::sleep(wait, kicks);
+                }
+            }
+            Err(MailError::Auth) if !logged_in || auth_failures >= AUTH_RETRIES => {
                 eprintln!("omamail watch: Gmail rejected the stored app password");
                 return 3;
             }
+            // It worked before: more likely a passing refusal (throttling, a
+            // security check) than a revoked password. Retry slowly, with the
+            // password as the keyring has it now.
+            Err(MailError::Auth) => {
+                auth_failures += 1;
+                let wait = AUTH_RETRY_FIRST.saturating_mul(1 << (auth_failures - 1).min(3)).min(AUTH_RETRY_MAX);
+                eprintln!("omamail watch: Gmail refused the login; retrying in {} min", wait.as_secs() / 60);
+                // Not cut short by network changes: refused logins must stay rare.
+                std::thread::sleep(wait);
+                if let Some(password) = secret::lookup(&email) {
+                    mailbox = Mailbox::new(account.clone(), password);
+                }
+            }
             Err(e) => {
-                eprintln!("omamail watch: {e}; retrying in {backoff}s");
-                std::thread::sleep(Duration::from_secs(backoff));
-                backoff = (backoff * 2).min(300);
+                let wait = backoff.next(e.is_offline());
+                eprintln!("omamail watch: {e}; retrying in {}s", wait.as_secs());
+                if liveness::sleep(wait, kicks) {
+                    backoff.reset();
+                }
             }
         }
     }
@@ -559,6 +651,41 @@ mod tests {
         assert_eq!(s.codes.len(), MAX_STORED_CODES);
         assert_eq!(s.code_for(0, 5000), None);
         assert_eq!(s.code_for(14, 5000).as_deref(), Some("000014"));
+    }
+
+    #[test]
+    fn retries_only_notifications_that_surely_were_not_shown() {
+        let missing = std::env::temp_dir().join(format!("omamail-nobus-{}.sock", std::process::id()));
+        assert!(matches!(send_notification_to(&missing, "Omamail", "s", "b", &[], -1), Err((_, true))));
+
+        // The bus takes Notify and then goes silent: it may be on screen.
+        let sock = std::env::temp_dir().join(format!("omamail-mute-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&sock);
+        let listener = UnixListener::bind(&sock).unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut conn, _) = listener.accept().unwrap();
+            let mut seen = Vec::new();
+            let mut b = [0u8; 1];
+            while !seen.ends_with(b"BEGIN\r\n") {
+                conn.read_exact(&mut b).unwrap();
+                seen.push(b[0]);
+                if seen.ends_with(b"\r\n") && !seen.ends_with(b"BEGIN\r\n") {
+                    conn.write_all(b"OK 0123456789abcdef0123456789abcdef\r\n").unwrap();
+                }
+            }
+            let mut head = [0u8; 16];
+            conn.read_exact(&mut head).unwrap();
+            let fields_len = u32::from_le_bytes([head[12], head[13], head[14], head[15]]) as usize;
+            let rest = ((16 + fields_len + 7) & !7) - 16;
+            conn.read_exact(&mut vec![0u8; rest]).unwrap();
+            conn.write_all(&[b'l', 2, 1, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0]).unwrap();
+            // Swallow Notify, never answer; hang up after the client gives up.
+            let _ = conn.read_to_end(&mut Vec::new());
+        });
+        let result = send_notification_to(&sock, "Omamail", "s", "b", &[], -1);
+        assert!(matches!(result, Err((_, false))));
+        let _ = server.join();
+        let _ = std::fs::remove_file(&sock);
     }
 
     #[test]
