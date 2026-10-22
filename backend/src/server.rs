@@ -24,7 +24,6 @@ use std::time::{Duration, Instant};
 
 const PAGE_SIZE: u32 = 50;
 const IDLE_TIMEOUT: Duration = Duration::from_secs(9 * 60);
-const AUTH_RETRY: Duration = Duration::from_secs(10 * 60);
 const RAW_CACHE: usize = 6;
 
 #[derive(Clone)]
@@ -419,10 +418,9 @@ fn spawn_idle(account: Account, password: String, out: Out, stop: Arc<AtomicBool
                         liveness::sleep(wait, kicks);
                     }
                 }
-                // The worker's requests report a rejected login to the window;
-                // here, keep trying now and then in case it passes.
-                // Not cut short by network changes: refused logins must stay rare.
-                Err(MailError::Auth) => std::thread::sleep(AUTH_RETRY),
+                // The worker's requests report a rejected login to the window,
+                // and signing in again starts a fresh thread.
+                Err(MailError::Auth) => return,
                 Err(e) => {
                     // Changes may have been missed while disconnected.
                     woke = true;

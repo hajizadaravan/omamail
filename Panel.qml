@@ -277,7 +277,8 @@ Item {
       selectedUid = -1
       cursor = -1
     }
-    listError = ""
+    // A background refresh keeps a shown error until it succeeds.
+    if (!quiet) listError = ""
     loadingList = true
     var token = ++listToken
     var searching = query.length > 0
@@ -290,6 +291,7 @@ Item {
         listError = data
         return handleError(data, code)
       }
+      listError = ""
       var rows = []
       for (var i = 0; i < data.messages.length; i++) rows.push(flatten(data.messages[i]))
       // Keep older loaded rows only if the new page reaches down to them;
