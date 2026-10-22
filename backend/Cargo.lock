@@ -777,7 +777,7 @@ dependencies = [
 
 [[package]]
 name = "omamail"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "ammonia",
  "base64 0.22.1",

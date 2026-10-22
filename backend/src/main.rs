@@ -32,3 +32,16 @@ fn main() {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    /// The plugin listing shows manifest.json's version and `omamail
+    /// --version` the crate's: every change bumps both (see CONTRIBUTING.md).
+    /// A stale Cargo.lock is caught by `cargo test --locked`, not here: a
+    /// plain `cargo test` rewrites it before this test is even compiled.
+    #[test]
+    fn manifest_and_crate_versions_match() {
+        let manifest: serde_json::Value = serde_json::from_str(include_str!("../../manifest.json")).unwrap();
+        assert_eq!(manifest["version"].as_str(), Some(env!("CARGO_PKG_VERSION")));
+    }
+}

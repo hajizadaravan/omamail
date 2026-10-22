@@ -33,6 +33,29 @@ Please include:
 
 Avoid unrelated refactoring or formatting changes in the same pull request.
 
+## Versioning
+
+Every change that lands on `main` reaches users as an update, so every
+change bumps the version, following [Semantic Versioning](https://semver.org).
+`1.0.0` is the first stable release; from there:
+
+- **Patch** (`1.0.0` → `1.0.1`): bug fixes and documentation.
+- **Minor** (`1.0.0` → `1.1.0`): new features that keep working setups working.
+- **Major** (`1.0.0` → `2.0.0`): changes that need users to do something,
+  such as rerunning `install.sh` by hand or signing in again.
+
+The version lives in `manifest.json` and `backend/Cargo.toml`, and
+`backend/Cargo.lock` follows `Cargo.toml`. Bump all three in the same
+commit: `install.sh` builds with `--locked`, so a stale lockfile breaks
+installs and updates. To update the lockfile, run `cargo build` once
+without `--locked`: it rewrites only Omamail's own entry. Do not run a
+plain `cargo update`, which would also move every dependency.
+
+Before committing, run `cargo test --locked` in `backend/`. It fails when
+`manifest.json` and `Cargo.toml` disagree, and, like `install.sh`, when
+`Cargo.lock` is stale; a plain `cargo test` would quietly fix the
+lockfile on your machine only.
+
 ## Testing
 
 Describe how you tested your changes in your pull request.
