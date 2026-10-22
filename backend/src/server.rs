@@ -131,6 +131,10 @@ impl Server {
 
     /// None when the reply is sent later by another thread (see `send`).
     fn handle(&mut self, req: &Value) -> Option<Reply> {
+        #[cfg(feature = "demo")]
+        if let Some(reply) = crate::demo::dispatch(req) {
+            return Some(reply.map_err(fail));
+        }
         let cmd = req.get("cmd").and_then(Value::as_str).unwrap_or_default();
         if cmd == "send" {
             return self.send(req);
@@ -441,7 +445,8 @@ pub fn run() {
     let worker_out = out.clone();
     std::thread::spawn(move || {
         let mut server = Server { out: worker_out.clone(), session: None, raw_cache: VecDeque::new() };
-        if let Some(account) = config::load_account() {
+        // The demo build answers from fixtures: no account, no connection.
+        if let Some(account) = config::load_account().filter(|_| !cfg!(feature = "demo")) {
             if let Some(password) = secret::lookup(&account.email) {
                 server.start_session(account, password);
             }

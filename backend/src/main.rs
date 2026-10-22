@@ -1,4 +1,6 @@
 mod config;
+#[cfg(feature = "demo")]
+mod demo;
 mod images;
 mod liveness;
 mod mailbox;
@@ -19,6 +21,11 @@ fn main() {
         libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0);
     }
     match std::env::args().nth(1).as_deref() {
+        // The demo build (screenshots) must never act on the real account.
+        Some("watch" | "update-check" | "copy") if cfg!(feature = "demo") => {
+            eprintln!("omamail: the demo build only serves the window");
+            std::process::exit(2);
+        }
         Some("serve") => server::run(),
         Some("watch") => std::process::exit(watch::run()),
         Some("update-check") => std::process::exit(update::check()),

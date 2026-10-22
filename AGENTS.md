@@ -8,8 +8,10 @@ Omamail: a Gmail client plugin for the Omarchy shell. QML panel
 
 ```bash
 cd backend && cargo test --locked && cargo clippy --locked   # before every commit
+cargo test --locked --features demo                          # if demo.rs or server.rs changed
 ./install.sh             # build + install backend, units, and the plugin files
 omarchy restart shell    # reload QML
+tools/make-preview.sh    # regenerate preview.png from the `demo` build (switches themes, restores them)
 ```
 
 Run from a dev checkout, `install.sh` copies the plugin into
