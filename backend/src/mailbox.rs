@@ -320,6 +320,22 @@ impl Mailbox {
         tcp.set_write_timeout(Some(NETWORK_TIMEOUT)).ok();
         liveness::keep_alive(&tcp);
         self.tracked = liveness::Tracked::new(&tcp);
+        match self.open_session(&host, tcp) {
+            Ok(session) => {
+                self.session = Some(session);
+                Ok(())
+            }
+            Err(e) => {
+                // Close the registered duplicate too, or the half-open
+                // socket lingers until the next attempt.
+                self.tracked = None;
+                Err(e)
+            }
+        }
+    }
+
+    /// TLS, greeting, LOGIN and (once) CAPABILITY over a fresh connection.
+    fn open_session(&mut self, host: &str, tcp: TcpStream) -> MailResult<Session> {
         let tls = match &self.tls {
             Some(tls) => tls.clone(),
             None => {
@@ -329,7 +345,7 @@ impl Mailbox {
                 tls
             }
         };
-        let stream = tls.connect(&host, tcp).map_err(|e| MailError::Network(e.to_string()))?;
+        let stream = tls.connect(host, tcp).map_err(|e| MailError::Network(e.to_string()))?;
         let mut client = imap::Client::new(Stream(stream));
         client.read_greeting()?;
         let mut session = client.login(&self.account.email, &self.password).map_err(|(e, _)| match e {
@@ -347,8 +363,7 @@ impl Mailbox {
                 .collect();
             self.capabilities_known = true;
         }
-        self.session = Some(session);
-        Ok(())
+        Ok(session)
     }
 
     pub fn close(&mut self) {
