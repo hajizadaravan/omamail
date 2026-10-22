@@ -1,0 +1,35 @@
+name: Marketplace
+
+# Pushing a version tag (git tag v1.2.3 && git push origin v1.2.3) asks the
+# Omarchy plugin marketplace to verify and publish that commit. A maintainer
+# still approves every update. To retry (e.g. after a repository migration
+# was recorded), run it by hand and pick the tag, not a branch.
+#
+# MARKETPLACE_TOKEN lives in the `marketplace` environment, which only `v*`
+# tags may deploy to, so a branch with an edited script never sees it.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: marketplace
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    environment: marketplace
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Request marketplace verification
+        env:
+          GH_TOKEN: ${{ secrets.MARKETPLACE_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        run: tools/marketplace-verify.sh

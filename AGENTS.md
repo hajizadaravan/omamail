@@ -12,7 +12,18 @@ cargo test --locked --features demo                          # if demo.rs or ser
 ./install.sh             # build + install backend, units, and the plugin files
 omarchy restart shell    # reload QML
 tools/make-preview.sh    # regenerate preview.png from the `demo` build (switches themes, restores them)
+git push origin main && git tag v1.2.3 && git push origin v1.2.3   # marketplace update request
 ```
+
+The tag must equal `manifest.json`'s version and point at main's HEAD (the
+marketplace accepts nothing else). `.github/workflows/marketplace.yml` then
+files the marketplace's verification request; a marketplace maintainer still
+approves it. It fails while the listing records an old repository path (after
+an account or repository rename) until a maintainer records the migration. It needs `MARKETPLACE_TOKEN` in the `marketplace` environment (only `v*`
+tags may deploy): a classic token with only `public_repo` and an expiry.
+Fine-grained tokens and `GITHUB_TOKEN` cannot open issues in another owner's
+repository; the classic token can write to every public repository of its
+account, so never widen the environment rule or log the token.
 
 Run from a dev checkout, `install.sh` copies the plugin into
 `~/.config/omarchy/plugins/reavann.omamail`, and refuses (exit 1) when that
