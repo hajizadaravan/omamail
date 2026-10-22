@@ -18,7 +18,7 @@ use std::net::{Shutdown, TcpStream};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex, MutexGuard, Once};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Keepalive: first probe after 45 s of silence, then every 10 s; the
 /// connection is given up 70 s after the last sign of life, which still
@@ -36,6 +36,11 @@ const RESUME_MIN: Duration = Duration::from_secs(2);
 /// Address changes come in bursts (DHCP, IPv6 autoconfiguration): wait for
 /// the burst to end, then reconnect once.
 const NETWORK_SETTLE: Duration = Duration::from_millis(1500);
+/// At most one network kick this often: every kick means a fresh login, and
+/// a flapping network (or forged router advertisements on a shared LAN) must
+/// not turn into a login every few seconds. A change within the gap is not
+/// dropped, only held until the gap is over.
+const NETWORK_KICK_GAP: Duration = Duration::from_secs(30);
 
 /// Reconnect delays once Gmail answered but the round failed, and while
 /// there is no network at all. Offline attempts never reach Gmail, so they
@@ -369,19 +374,36 @@ fn watch_addresses() {
     let Some(fd) = netlink_socket(groups) else { return };
     let mut known = current_addresses();
     let mut buf = vec![0u8; 32 * 1024];
+    let mut last_kick: Option<Instant> = None;
+    let mut pending = false;
     loop {
+        if pending {
+            let left = last_kick.map_or(Duration::ZERO, |t| NETWORK_KICK_GAP.saturating_sub(t.elapsed()));
+            // A zero timeval would mean "no timeout": treat a sliver as done.
+            if left < Duration::from_millis(1) {
+                kick("network changed");
+                last_kick = Some(Instant::now());
+                pending = false;
+                continue;
+            }
+            set_recv_timeout(&fd, Some(left));
+        } else {
+            set_recv_timeout(&fd, None);
+        }
         let n = unsafe { libc::recv(fd.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len(), 0) };
         if n < 0 {
             match std::io::Error::last_os_error().raw_os_error() {
-                Some(libc::EINTR) => continue,
+                Some(libc::EINTR) => {}
+                // The held-back kick is due.
+                Some(e) if e == libc::EAGAIN || e == libc::EWOULDBLOCK => {}
                 // The kernel dropped notifications: we may have missed a change.
                 Some(libc::ENOBUFS) => {
                     known = current_addresses();
-                    kick("network changed");
-                    continue;
+                    pending = true;
                 }
                 _ => return,
             }
+            continue;
         }
         if n == 0 {
             return;
@@ -393,8 +415,7 @@ fn watch_addresses() {
         while let Some(n) = receive(&fd, &mut buf) {
             apply(&buf[..n], &mut known, false);
         }
-        set_recv_timeout(&fd, None);
-        kick("network changed");
+        pending = true;
     }
 }
 

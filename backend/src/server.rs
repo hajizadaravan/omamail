@@ -421,9 +421,8 @@ fn spawn_idle(account: Account, password: String, out: Out, stop: Arc<AtomicBool
                 }
                 // The worker's requests report a rejected login to the window;
                 // here, keep trying now and then in case it passes.
-                Err(MailError::Auth) => {
-                    liveness::sleep(AUTH_RETRY, kicks);
-                }
+                // Not cut short by network changes: refused logins must stay rare.
+                Err(MailError::Auth) => std::thread::sleep(AUTH_RETRY),
                 Err(e) => {
                     // Changes may have been missed while disconnected.
                     woke = true;

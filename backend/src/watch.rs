@@ -598,7 +598,8 @@ pub fn run() -> i32 {
                 auth_failures += 1;
                 let wait = AUTH_RETRY_FIRST.saturating_mul(1 << (auth_failures - 1).min(3)).min(AUTH_RETRY_MAX);
                 eprintln!("omamail watch: Gmail refused the login; retrying in {} min", wait.as_secs() / 60);
-                liveness::sleep(wait, kicks);
+                // Not cut short by network changes: refused logins must stay rare.
+                std::thread::sleep(wait);
                 if let Some(password) = secret::lookup(&email) {
                     mailbox = Mailbox::new(account.clone(), password);
                 }
