@@ -11,7 +11,7 @@ Item {
   id: root
 
   required property var app
-  // {to, cc, subject, body, in_reply_to, references, attachments, forward_folder, forward_uid}
+  // {to, cc, subject, body, in_reply_to, references, attachments, forward_folder, forward_uid, uidvalidity}
   required property var draft
 
   property var files: []
@@ -42,7 +42,8 @@ Item {
       in_reply_to: root.draft.in_reply_to,
       references: root.draft.references,
       forward_folder: forwarding ? root.draft.forward_folder : "",
-      forward_uid: forwarding ? root.draft.forward_uid : 0
+      forward_uid: forwarding ? root.draft.forward_uid : 0,
+      uidvalidity: forwarding ? (root.draft.uidvalidity || 0) : 0
     })
   }
 

@@ -4,7 +4,7 @@ use crate::utf7;
 use imap::types::{Fetch, Flag, NameAttribute, UnsolicitedResponse};
 use mail_parser::{Address, MessageParser};
 use native_tls::{TlsConnector, TlsStream};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::io::{Read, Write};
@@ -13,7 +13,8 @@ use std::time::Duration;
 
 type Session = imap::Session<Stream>;
 
-const HEADER_FETCH: &str = "(UID FLAGS INTERNALDATE BODY.PEEK[HEADER.FIELDS (FROM TO SUBJECT DATE CONTENT-TYPE)])";
+const HEADER_FETCH: &str =
+    "(UID FLAGS INTERNALDATE BODY.PEEK[HEADER.FIELDS (FROM TO SUBJECT DATE CONTENT-TYPE)])";
 const NETWORK_TIMEOUT: Duration = Duration::from_secs(45);
 /// Ending IDLE: the connection is dropped right after (see `idle`), so the
 /// DONE reply only needs a short wait, and a dead link must not cost 45 s.
@@ -111,16 +112,17 @@ pub struct Folder {
     pub unread: u32,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Person {
     pub name: String,
     pub email: String,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Summary {
     pub uid: u32,
     pub from: Vec<Person>,
+    #[serde(default)]
     pub to: Vec<Person>,
     pub subject: String,
     pub timestamp: i64,
@@ -133,13 +135,19 @@ pub struct Summary {
 pub struct Page {
     pub messages: Vec<Summary>,
     pub total: u32,
+    /// UIDVALIDITY of the selected folder. Zero when this page did not come
+    /// from a SELECT. Headers saved under another value are a different
+    /// mailbox and must not be mixed into the list.
+    pub uidvalidity: u32,
 }
 
 /// Sender-controlled text shown next to addresses: drops control and
 /// invisible bidi/zero-width characters that could make "<evil@x>" render
 /// as something else.
 pub fn display_text(text: &str) -> String {
-    text.chars().filter(|c| !c.is_control() && !is_format_char(*c)).collect()
+    text.chars()
+        .filter(|c| !c.is_control() && !is_format_char(*c))
+        .collect()
 }
 
 pub fn is_format_char(c: char) -> bool {
@@ -169,7 +177,12 @@ fn summary(fetch: &Fetch) -> Option<Summary> {
     let timestamp = fetch
         .internal_date()
         .map(|d| d.timestamp())
-        .or_else(|| parsed.as_ref().and_then(|m| m.date()).map(|d| d.to_timestamp()))
+        .or_else(|| {
+            parsed
+                .as_ref()
+                .and_then(|m| m.date())
+                .map(|d| d.to_timestamp())
+        })
         .unwrap_or(0);
     let (from, to, subject, mixed) = match &parsed {
         Some(m) => (
@@ -180,7 +193,9 @@ fn summary(fetch: &Fetch) -> Option<Summary> {
                 h.name.as_str().eq_ignore_ascii_case("content-type")
                     && h.value.as_content_type().is_some_and(|ct| {
                         ct.ctype().eq_ignore_ascii_case("multipart")
-                            && ct.subtype().is_some_and(|s| s.eq_ignore_ascii_case("mixed"))
+                            && ct
+                                .subtype()
+                                .is_some_and(|s| s.eq_ignore_ascii_case("mixed"))
                     })
             }),
         ),
@@ -205,7 +220,11 @@ pub fn uid_set(uids: &[u32]) -> MailResult<String> {
     if sorted.is_empty() || sorted.contains(&0) {
         return Err(MailError::Server("No messages selected".into()));
     }
-    Ok(sorted.iter().map(u32::to_string).collect::<Vec<_>>().join(","))
+    Ok(sorted
+        .iter()
+        .map(u32::to_string)
+        .collect::<Vec<_>>()
+        .join(","))
 }
 
 /// Line breaks or NUL would end the IMAP command early and start another.
@@ -213,7 +232,10 @@ fn quote(value: &str) -> MailResult<String> {
     if value.contains(['\r', '\n', '\0']) {
         return Err(MailError::Server("Invalid characters in name".into()));
     }
-    Ok(format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\"")))
+    Ok(format!(
+        "\"{}\"",
+        value.replace('\\', "\\\\").replace('"', "\\\"")
+    ))
 }
 
 /// Parses `* STATUS "name" (UNSEEN 3 UIDNEXT 9)` lines. imap 2.4 routes STATUS
@@ -300,7 +322,12 @@ impl Mailbox {
             .collect();
         // The address that worked last, then its family, then the rest.
         let preferred = self.preferred;
-        addrs.sort_by_key(|a| (Some(*a) != preferred, preferred.is_some_and(|p| p.is_ipv4() != a.is_ipv4())));
+        addrs.sort_by_key(|a| {
+            (
+                Some(*a) != preferred,
+                preferred.is_some_and(|p| p.is_ipv4() != a.is_ipv4()),
+            )
+        });
         // Try every address: a network with broken IPv6 must not cost a
         // full timeout before failing.
         let mut last = MailError::Offline(format!("{host}: no address"));
@@ -345,13 +372,19 @@ impl Mailbox {
                 tls
             }
         };
-        let stream = tls.connect(host, tcp).map_err(|e| MailError::Network(e.to_string()))?;
+        let stream = tls
+            .connect(host, tcp)
+            .map_err(|e| MailError::Network(e.to_string()))?;
         let mut client = imap::Client::new(Stream(stream));
         client.read_greeting()?;
-        let mut session = client.login(&self.account.email, &self.password).map_err(|(e, _)| match e {
-            imap::Error::No(msg) | imap::Error::Bad(msg) if is_auth_failure(&msg) => MailError::Auth,
-            other => MailError::from(other),
-        })?;
+        let mut session = client
+            .login(&self.account.email, &self.password)
+            .map_err(|(e, _)| match e {
+                imap::Error::No(msg) | imap::Error::Bad(msg) if is_auth_failure(&msg) => {
+                    MailError::Auth
+                }
+                other => MailError::from(other),
+            })?;
         // The server's capabilities do not change between connections; asking
         // once saves a round trip on every reconnect.
         if !self.capabilities_known {
@@ -390,10 +423,15 @@ impl Mailbox {
     /// Clears the unsolicited responses collected during the last command,
     /// remembering whether they announced new messages.
     fn drain_unsolicited(&mut self) {
-        let Some(s) = self.session.as_mut() else { return };
+        let Some(s) = self.session.as_mut() else {
+            return;
+        };
         let mut arrived = false;
         while let Ok(r) = s.unsolicited_responses.try_recv() {
-            arrived |= matches!(r, UnsolicitedResponse::Exists(_) | UnsolicitedResponse::Recent(_));
+            arrived |= matches!(
+                r,
+                UnsolicitedResponse::Exists(_) | UnsolicitedResponse::Recent(_)
+            );
         }
         self.arrived |= arrived;
     }
@@ -423,7 +461,9 @@ impl Mailbox {
     }
 
     fn session(&mut self) -> MailResult<&mut Session> {
-        self.session.as_mut().ok_or_else(|| MailError::Network("not connected".into()))
+        self.session
+            .as_mut()
+            .ok_or_else(|| MailError::Network("not connected".into()))
     }
 
     // ------------------------------------------------------------- folders
@@ -442,7 +482,10 @@ impl Mailbox {
                         _ => String::new(),
                     })
                     .collect();
-                if attrs.iter().any(|a| a == "\\noselect" || a == "\\nonexistent") {
+                if attrs
+                    .iter()
+                    .any(|a| a == "\\noselect" || a == "\\nonexistent")
+                {
                     continue;
                 }
                 let path = n.name().to_string();
@@ -464,16 +507,27 @@ impl Mailbox {
                     continue;
                 }
                 let delim = n.delimiter().unwrap_or("/");
-                let mut name = if role == Some("inbox") { "Inbox".to_string() } else { utf7::decode(&path) };
+                let mut name = if role == Some("inbox") {
+                    "Inbox".to_string()
+                } else {
+                    utf7::decode(&path)
+                };
                 let gmail_prefix = format!("[Gmail]{delim}");
                 if let Some(stripped) = name.strip_prefix(&gmail_prefix) {
                     name = stripped.to_string();
                 }
-                found.push(Folder { path, name, role, unread: 0 });
+                found.push(Folder {
+                    path,
+                    name,
+                    role,
+                    unread: 0,
+                });
             }
             found.sort_by_key(|f| {
                 (
-                    f.role.and_then(|r| ROLE_ORDER.iter().position(|o| *o == r)).unwrap_or(ROLE_ORDER.len()),
+                    f.role
+                        .and_then(|r| ROLE_ORDER.iter().position(|o| *o == r))
+                        .unwrap_or(ROLE_ORDER.len()),
                     f.name.to_lowercase(),
                 )
             });
@@ -509,10 +563,11 @@ impl Mailbox {
         if self.folders.is_none() {
             self.folders(false)?;
         }
-        Ok(self
-            .folders
-            .as_ref()
-            .and_then(|fs| fs.iter().find(|f| f.role == Some(role)).map(|f| f.path.clone())))
+        Ok(self.folders.as_ref().and_then(|fs| {
+            fs.iter()
+                .find(|f| f.role == Some(role))
+                .map(|f| f.path.clone())
+        }))
     }
 
     fn select(&mut self, path: &str, force: bool) -> MailResult<()> {
@@ -555,18 +610,30 @@ impl Mailbox {
                             .collect();
                         older.sort_unstable_by(|a, b| b.cmp(a));
                         older.truncate(limit as usize);
-                        return Ok(Page { messages: mb.headers_by_uid(&older)?, total });
+                        return Ok(Page {
+                            messages: mb.headers_by_uid(&older)?,
+                            total,
+                            uidvalidity: mb.uidvalidity,
+                        });
                     }
                 }
             };
             if hi == 0 {
-                return Ok(Page { messages: vec![], total });
+                return Ok(Page {
+                    messages: vec![],
+                    total,
+                    uidvalidity: mb.uidvalidity,
+                });
             }
             let lo = hi.saturating_sub(limit - 1).max(1);
             let fetches = mb.session()?.fetch(format!("{lo}:{hi}"), HEADER_FETCH)?;
             let mut messages: Vec<Summary> = fetches.iter().filter_map(summary).collect();
             messages.sort_by_key(|m| std::cmp::Reverse(m.uid));
-            Ok(Page { messages, total })
+            Ok(Page {
+                messages,
+                total,
+                uidvalidity: mb.uidvalidity,
+            })
         })
     }
 
@@ -575,16 +642,28 @@ impl Mailbox {
     /// words, so "neuro" alone would never find "NeuroBridge" there; the web
     /// UI does prefix matching that IMAP does not expose.
     pub fn search(&mut self, path: &str, query: &str, limit: usize) -> MailResult<Page> {
-        let query: String = query.replace(['\r', '\n', '\0'], " ").chars().take(500).collect();
+        let query: String = query
+            .replace(['\r', '\n', '\0'], " ")
+            .chars()
+            .take(500)
+            .collect();
         // Gmail answers a blank query with the whole folder.
         if query.trim().is_empty() {
-            return Ok(Page { messages: vec![], total: 0 });
+            return Ok(Page {
+                messages: vec![],
+                total: 0,
+                uidvalidity: 0,
+            });
         }
         // Operators (from:, has:attachment, -word) only make sense to Gmail.
         let plain = !query.contains(':') && !query.split_whitespace().any(|w| w.starts_with('-'));
         self.run(|mb| {
             mb.select(path, true)?;
-            let key = if mb.has_capability("X-GM-EXT-1") { "X-GM-RAW" } else { "TEXT" };
+            let key = if mb.has_capability("X-GM-EXT-1") {
+                "X-GM-RAW"
+            } else {
+                "TEXT"
+            };
             let criteria = format!("CHARSET UTF-8 {key} {}", mb.astring(&query)?);
             let mut found: HashSet<u32> = mb.session()?.uid_search(criteria)?;
             let words: Vec<String> = fold(&query).split_whitespace().map(String::from).collect();
@@ -604,7 +683,11 @@ impl Mailbox {
             uids.sort_unstable_by(|a, b| b.cmp(a));
             let total = uids.len() as u32;
             uids.truncate(limit);
-            Ok(Page { messages: mb.headers_by_uid(&uids)?, total })
+            Ok(Page {
+                messages: mb.headers_by_uid(&uids)?,
+                total,
+                uidvalidity: mb.uidvalidity,
+            })
         })
     }
 
@@ -625,7 +708,9 @@ impl Mailbox {
             .filter(|i| i.uidvalidity == validity && i.max_uid > 0)
             .map(|i| i.max_uid);
         let fetches = match current {
-            Some(max) => self.session()?.uid_fetch(format!("{}:*", max.saturating_add(1)), INDEX_FETCH)?,
+            Some(max) => self
+                .session()?
+                .uid_fetch(format!("{}:*", max.saturating_add(1)), INDEX_FETCH)?,
             None => {
                 let lo = self.exists.saturating_sub(INDEX_LIMIT as u32 - 1).max(1);
                 self.session()?.fetch(format!("{lo}:*"), INDEX_FETCH)?
@@ -635,7 +720,9 @@ impl Mailbox {
         let floor = current.unwrap_or(0);
         for f in fetches.iter() {
             // `N:*` also returns the highest UID when it is below N.
-            let Some(uid) = f.uid.filter(|u| *u > floor) else { continue };
+            let Some(uid) = f.uid.filter(|u| *u > floor) else {
+                continue;
+            };
             fresh.push((uid, index_text(f.header().unwrap_or_default())));
         }
         drop(fetches);
@@ -643,7 +730,10 @@ impl Mailbox {
         // folder; drop it so it neither counts nor takes a result slot.
         let index = self.indexes.entry(path.to_string()).or_default();
         if current.is_none() {
-            *index = HeaderIndex { uidvalidity: validity, ..HeaderIndex::default() };
+            *index = HeaderIndex {
+                uidvalidity: validity,
+                ..HeaderIndex::default()
+            };
         }
         index.entries.extend(fresh);
         index.entries.sort_unstable_by_key(|(uid, _)| *uid);
@@ -666,7 +756,8 @@ impl Mailbox {
     /// (RFC 7888), because quoted strings must be 7-bit and Gmail rejects
     /// "Təbriklər" in one. Callers strip CR/LF first.
     fn astring(&self, value: &str) -> MailResult<String> {
-        let literal_ok = self.has_capability("LITERAL+") || (self.has_capability("LITERAL-") && value.len() <= 4096);
+        let literal_ok = self.has_capability("LITERAL+")
+            || (self.has_capability("LITERAL-") && value.len() <= 4096);
         if value.is_ascii() || !literal_ok {
             quote(value)
         } else {
@@ -697,7 +788,9 @@ impl Mailbox {
             // Fetched even when UIDNEXT says nothing is new: it costs one
             // round trip, and a UIDNEXT that lags behind would hide new mail.
             if let Some((_, last_uid)) = since.filter(|(validity, _)| *validity == mb.uidvalidity) {
-                let fetches = mb.session()?.uid_fetch(format!("{}:*", last_uid.saturating_add(1)), HEADER_FETCH)?;
+                let fetches = mb
+                    .session()?
+                    .uid_fetch(format!("{}:*", last_uid.saturating_add(1)), HEADER_FETCH)?;
                 // `N:*` always matches the highest UID, even when it is below
                 // N, and imap 2.4 mixes unsolicited FETCH responses (flag
                 // changes, without headers) into the result.
@@ -710,7 +803,11 @@ impl Mailbox {
                 messages.sort_by_key(|m| m.uid);
                 messages.dedup_by_key(|m| m.uid);
             }
-            Ok(NewMail { uidvalidity: mb.uidvalidity, uidnext: mb.uidnext, messages })
+            Ok(NewMail {
+                uidvalidity: mb.uidvalidity,
+                uidnext: mb.uidnext,
+                messages,
+            })
         })
     }
 
@@ -726,17 +823,53 @@ impl Mailbox {
 
     // ------------------------------------------------------------- messages
 
-    pub fn fetch_raw(&mut self, path: &str, uid: u32, mark_seen: bool) -> MailResult<Vec<u8>> {
+    /// UIDVALIDITY from the last SELECT on this connection. Zero before that.
+    pub fn uidvalidity(&self) -> u32 {
+        self.uidvalidity
+    }
+
+    /// That value only if `path` is the folder currently selected. Another
+    /// folder can use the same number, so a body cached for `path` must not
+    /// be trusted just because the number matches.
+    pub fn validity_if_selected(&self, path: &str) -> Option<u32> {
+        (self.selected.as_deref() == Some(path) && self.uidvalidity != 0)
+            .then_some(self.uidvalidity)
+    }
+
+    /// UIDVALIDITY changed means these UIDs now name different messages.
+    /// `expected == 0` skips the check (callers that have not learned it yet).
+    /// Compares the last SELECT; it does not force another round trip.
+    fn reject_reused_uids(&self, expected: u32) -> MailResult<()> {
+        if expected != 0 && self.uidvalidity != expected {
+            Err(MailError::Server(
+                "the mailbox changed, so this was not applied".into(),
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
+    pub fn fetch_raw(
+        &mut self,
+        path: &str,
+        uid: u32,
+        mark_seen: bool,
+        expected_validity: u32,
+    ) -> MailResult<Vec<u8>> {
         self.run(|mb| {
             mb.select(path, false)?;
-            let fetches = mb.session()?.uid_fetch(uid.to_string(), "(UID FLAGS BODY.PEEK[])")?;
-            let found = fetches.iter().find(|f| f.uid == Some(uid)).ok_or(MailError::Gone)?;
+            mb.reject_reused_uids(expected_validity)?;
+            let query = if mark_seen {
+                "(UID FLAGS BODY[])"
+            } else {
+                "(UID FLAGS BODY.PEEK[])"
+            };
+            let fetches = mb.session()?.uid_fetch(uid.to_string(), query)?;
+            let found = fetches
+                .iter()
+                .find(|f| f.uid == Some(uid))
+                .ok_or(MailError::Gone)?;
             let raw = found.body().map(<[u8]>::to_vec).ok_or(MailError::Gone)?;
-            let seen = found.flags().contains(&Flag::Seen);
-            drop(fetches);
-            if mark_seen && !seen {
-                mb.session()?.uid_store(uid.to_string(), "+FLAGS.SILENT (\\Seen)")?;
-            }
             Ok(raw)
         })
     }
@@ -753,9 +886,16 @@ impl Mailbox {
         if let Some(t) = &self.tracked {
             t.set_read_timeout(PREVIEW_TIMEOUT);
         }
-        let result = self.session()?.uid_fetch(set, "(UID BODY.PEEK[]<0.65536>)").map(|fetches| {
-            fetches.iter().filter_map(|f| Some((f.uid?, f.body()?.to_vec()))).filter(|(uid, _)| uids.contains(uid)).collect()
-        });
+        let result = self
+            .session()?
+            .uid_fetch(set, "(UID BODY.PEEK[]<0.65536>)")
+            .map(|fetches| {
+                fetches
+                    .iter()
+                    .filter_map(|f| Some((f.uid?, f.body()?.to_vec())))
+                    .filter(|(uid, _)| uids.contains(uid))
+                    .collect()
+            });
         match result {
             Ok(previews) => {
                 if let Some(t) = &self.tracked {
@@ -772,7 +912,14 @@ impl Mailbox {
         }
     }
 
-    pub fn set_flag(&mut self, path: &str, uids: &[u32], flag: &str, on: bool) -> MailResult<()> {
+    pub fn set_flag(
+        &mut self,
+        path: &str,
+        uids: &[u32],
+        flag: &str,
+        on: bool,
+        expected_validity: u32,
+    ) -> MailResult<()> {
         let flag = match flag {
             "seen" => "\\Seen",
             "flagged" => "\\Flagged",
@@ -781,16 +928,24 @@ impl Mailbox {
         let set = uid_set(uids)?;
         self.run(|mb| {
             mb.select(path, false)?;
+            mb.reject_reused_uids(expected_validity)?;
             let op = if on { "+FLAGS.SILENT" } else { "-FLAGS.SILENT" };
             mb.session()?.uid_store(&set, format!("{op} ({flag})"))?;
             Ok(())
         })
     }
 
-    pub fn move_to(&mut self, path: &str, uids: &[u32], dest: &str) -> MailResult<()> {
+    pub fn move_to(
+        &mut self,
+        path: &str,
+        uids: &[u32],
+        dest: &str,
+        expected_validity: u32,
+    ) -> MailResult<()> {
         let set = uid_set(uids)?;
         self.run(|mb| {
             mb.select(path, false)?;
+            mb.reject_reused_uids(expected_validity)?;
             if mb.has_capability("MOVE") {
                 mb.session()?.uid_mv(&set, dest)?;
                 return Ok(());
@@ -821,7 +976,10 @@ impl Mailbox {
         if let Some(t) = &self.tracked {
             t.set_read_timeout(IDLE_START_TIMEOUT);
         }
-        let started = self.session()?.idle().map(|handle| handle.wait_with_timeout(timeout));
+        let started = self
+            .session()?
+            .idle()
+            .map(|handle| handle.wait_with_timeout(timeout));
         // imap 2.4 sends DONE and reads its reply while dropping the IDLE
         // handle, ignoring errors. If that reply is late, the next command
         // would read it and trip imap's tag assertion, so the connection is
@@ -837,7 +995,11 @@ impl Mailbox {
             // real problem and goes through the caller's backoff.
             Err(e) => {
                 self.idle_start_failures += 1;
-                return if self.idle_start_failures == 1 { Ok(true) } else { Err(e.into()) };
+                return if self.idle_start_failures == 1 {
+                    Ok(true)
+                } else {
+                    Err(e.into())
+                };
             }
         };
         match outcome? {
@@ -854,7 +1016,9 @@ const INDEX_FETCH: &str = "(UID BODY.PEEK[HEADER.FIELDS (FROM SUBJECT)]<0.2048>)
 
 /// Folded "subject sender-name sender-email", each part capped.
 fn index_text(header: &[u8]) -> String {
-    let Some(m) = MessageParser::new().parse_headers(header) else { return String::new() };
+    let Some(m) = MessageParser::new().parse_headers(header) else {
+        return String::new();
+    };
     let mut hay: String = m.subject().unwrap_or_default().chars().take(300).collect();
     for p in people(m.from()).into_iter().take(3) {
         hay.push(' ');
@@ -884,9 +1048,16 @@ fn fold(text: &str) -> String {
 /// should send the user back to the sign-in screen.
 fn is_auth_failure(message: &str) -> bool {
     let m = message.to_ascii_lowercase();
-    ["invalid credentials", "authenticationfailed", "application-specific password", "web browser", "web login", "password"]
-        .iter()
-        .any(|k| m.contains(k))
+    [
+        "invalid credentials",
+        "authenticationfailed",
+        "application-specific password",
+        "web browser",
+        "web login",
+        "password",
+    ]
+    .iter()
+    .any(|k| m.contains(k))
 }
 
 #[cfg(test)]
@@ -895,7 +1066,8 @@ mod tests {
 
     #[test]
     fn reads_status_items() {
-        let raw = b"* STATUS \"[Gmail]/Spam\" (UIDNEXT 120 UIDVALIDITY 7 UNSEEN 3)\r\nA1 OK done\r\n";
+        let raw =
+            b"* STATUS \"[Gmail]/Spam\" (UIDNEXT 120 UIDVALIDITY 7 UNSEEN 3)\r\nA1 OK done\r\n";
         assert_eq!(status_value(raw, "UNSEEN"), Some(3));
         assert_eq!(status_value(raw, "UIDNEXT"), Some(120));
         assert_eq!(status_value(raw, "UIDVALIDITY"), Some(7));
@@ -926,8 +1098,26 @@ mod tests {
     fn only_credential_errors_are_auth() {
         assert!(is_auth_failure("Invalid credentials (Failure)"));
         assert!(is_auth_failure("Application-specific password required"));
-        assert!(!is_auth_failure("Too many simultaneous connections. (Failure)"));
-        assert!(!is_auth_failure("Temporary System Problem. Try again later"));
+        assert!(!is_auth_failure(
+            "Too many simultaneous connections. (Failure)"
+        ));
+        assert!(!is_auth_failure(
+            "Temporary System Problem. Try again later"
+        ));
+    }
+
+    #[test]
+    fn a_rebuilt_mailbox_does_not_reuse_uids() {
+        let mut mb = Mailbox::new(super::Account::gmail("a@b.c"), String::new());
+        assert!(mb.reject_reused_uids(0).is_ok());
+        mb.uidvalidity = 4;
+        assert!(mb.reject_reused_uids(4).is_ok());
+        let err = mb.reject_reused_uids(9).unwrap_err();
+        assert!(err.to_string().contains("mailbox changed"));
+        assert_eq!(mb.validity_if_selected("INBOX"), None);
+        mb.selected = Some("INBOX".into());
+        assert_eq!(mb.validity_if_selected("INBOX"), Some(4));
+        assert_eq!(mb.validity_if_selected("Sent"), None);
     }
 
     #[test]

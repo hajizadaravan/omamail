@@ -142,11 +142,17 @@ so let's keep every colour coming from the theme and avoid hard-coded accents.</
 ];
 
 fn now() -> i64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 fn person((name, email): (&str, &str)) -> Person {
-    Person { name: name.into(), email: email.into() }
+    Person {
+        name: name.into(),
+        email: email.into(),
+    }
 }
 
 fn summary(m: &Mail) -> Summary {
@@ -164,7 +170,12 @@ fn summary(m: &Mail) -> Summary {
 
 fn folders() -> Vec<Folder> {
     let unread = INBOX.iter().filter(|m| !m.seen).count() as u32;
-    let folder = |path: &str, name: &str, role, unread| Folder { path: path.into(), name: name.into(), role, unread };
+    let folder = |path: &str, name: &str, role, unread| Folder {
+        path: path.into(),
+        name: name.into(),
+        role,
+        unread,
+    };
     vec![
         folder("INBOX", "Inbox", Some("inbox"), unread),
         folder("[Gmail]/Starred", "Starred", Some("flagged"), 0),
@@ -216,7 +227,9 @@ fn rfc2822(ts: i64) -> String {
     let month = if mp < 10 { mp + 3 } else { mp - 9 };
     let year = yoe + era * 400 + i64::from(month <= 2);
     let weekday = ["Thu", "Fri", "Sat", "Sun", "Mon", "Tue", "Wed"][days.rem_euclid(7) as usize];
-    let months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+    let months = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
     format!(
         "{weekday}, {day:02} {} {year} {:02}:{:02}:{:02} +0000",
         months[(month - 1) as usize],
@@ -237,23 +250,56 @@ pub fn dispatch(req: &Value) -> Option<Result<Value, String>> {
     Some(match cmd {
         "status" => Ok(json!({"configured": true, "email": ME.1})),
         "folders" => Ok(json!(folders())),
-        "unread" => Ok(json!(folders().iter().find(|f| f.path == folder).map_or(0, |f| f.unread))),
+        "unread" => Ok(json!(
+            folders()
+                .iter()
+                .find(|f| f.path == folder)
+                .map_or(0, |f| f.unread)
+        )),
         "list" => {
             let messages = messages(folder);
-            Ok(json!(Page { total: messages.len() as u32, messages }))
+            Ok(json!(Page {
+                total: messages.len() as u32,
+                messages,
+                uidvalidity: 1
+            }))
+        }
+        "cached" => {
+            let messages = messages(folder);
+            Ok(json!(Page {
+                total: messages.len() as u32,
+                messages,
+                uidvalidity: 1
+            }))
         }
         "search" => {
-            let query = req.get("query").and_then(Value::as_str).unwrap_or_default().to_lowercase();
+            let query = req
+                .get("query")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_lowercase();
             let messages: Vec<Summary> = messages(folder)
                 .into_iter()
-                .filter(|m| m.subject.to_lowercase().contains(&query) || m.from[0].name.to_lowercase().contains(&query))
+                .filter(|m| {
+                    m.subject.to_lowercase().contains(&query)
+                        || m.from[0].name.to_lowercase().contains(&query)
+                })
                 .collect();
-            Ok(json!(Page { total: messages.len() as u32, messages }))
+            Ok(json!(Page {
+                total: messages.len() as u32,
+                messages,
+                uidvalidity: 1
+            }))
         }
-        "open" => raw(uid).map(|raw| json!(message::render(&raw, uid, false))).ok_or_else(|| "No such message".into()),
+        "open" => raw(uid)
+            .map(|raw| json!(message::render(&raw, uid, false)))
+            .ok_or_else(|| "No such message".into()),
         "draft" => {
             let mode = req.get("mode").and_then(Value::as_str).unwrap_or("reply");
-            raw(uid).and_then(|raw| message::draft(&raw, mode, ME.1)).map(|d| json!(d)).ok_or_else(|| "No such message".into())
+            raw(uid)
+                .and_then(|raw| message::draft(&raw, mode, ME.1))
+                .map(|d| json!(d))
+                .ok_or_else(|| "No such message".into())
         }
         "flag" | "move" => Ok(Value::Null),
         "login" | "logout" | "send" | "attachment" => Err("Not available in the demo build".into()),
@@ -277,9 +323,14 @@ mod tests {
             let view = json!(message::render(&raw(m.uid).unwrap(), m.uid, false));
             assert_eq!(view["subject"], m.subject);
         }
-        let page = dispatch(&json!({"cmd": "list", "folder": "INBOX"})).unwrap().unwrap();
+        let page = dispatch(&json!({"cmd": "list", "folder": "INBOX"}))
+            .unwrap()
+            .unwrap();
         for cmd in ["login", "logout", "send", "attachment"] {
-            assert!(matches!(dispatch(&json!({"cmd": cmd})), Some(Err(_))), "{cmd} must not reach the real handler");
+            assert!(
+                matches!(dispatch(&json!({"cmd": cmd})), Some(Err(_))),
+                "{cmd} must not reach the real handler"
+            );
         }
         assert_eq!(page["messages"].as_array().unwrap().len(), INBOX.len());
     }

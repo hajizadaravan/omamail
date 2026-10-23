@@ -2,6 +2,7 @@ mod config;
 #[cfg(feature = "demo")]
 mod demo;
 mod images;
+mod listcache;
 mod liveness;
 mod mailbox;
 mod message;
@@ -32,9 +33,13 @@ fn main() {
         Some("copy") => std::process::exit(watch::copy(std::env::args().nth(2).as_deref())),
         Some("--version") => println!("omamail {}", env!("CARGO_PKG_VERSION")),
         _ => {
-            eprintln!("usage: omamail serve   # backend for the Omamail window (JSON lines on stdio)");
+            eprintln!(
+                "usage: omamail serve   # backend for the Omamail window (JSON lines on stdio)"
+            );
             eprintln!("       omamail watch   # new-mail notifications (run as a user service)");
-            eprintln!("       omamail update-check   # notify when the plugin has updates (run by a user timer)");
+            eprintln!(
+                "       omamail update-check   # notify when the plugin has updates (run by a user timer)"
+            );
             std::process::exit(2);
         }
     }
@@ -48,7 +53,11 @@ mod tests {
     /// plain `cargo test` rewrites it before this test is even compiled.
     #[test]
     fn manifest_and_crate_versions_match() {
-        let manifest: serde_json::Value = serde_json::from_str(include_str!("../../manifest.json")).unwrap();
-        assert_eq!(manifest["version"].as_str(), Some(env!("CARGO_PKG_VERSION")));
+        let manifest: serde_json::Value =
+            serde_json::from_str(include_str!("../../manifest.json")).unwrap();
+        assert_eq!(
+            manifest["version"].as_str(),
+            Some(env!("CARGO_PKG_VERSION"))
+        );
     }
 }

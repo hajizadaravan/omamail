@@ -29,6 +29,11 @@ verification codes.
   sensitive and stays out of clipboard history.
 - **Keyboard first.** Move with `j`/`k`, search with `/` (Gmail syntax),
   compose with `c`. See [Keys](#keys).
+- **Opens on the last list.** The newest 200 headers of each folder you
+  open are kept in `~/.local/state/omamail/list.json` (readable only by
+  you), so the list is there when the window opens and settles when Gmail
+  replies. Starring or moving a saved row waits until that reply confirms
+  the mailbox. Signing out deletes the file.
 - **Light.** A ~3 MB Rust backend using about 7 MB of RAM. Closing the
   window ends it; only the notification service keeps running.
 - **Careful with mail.** HTML is sanitized, remote images load only when
@@ -121,7 +126,7 @@ enabling the plugin.
 |---|---|
 | **Network** | `imap.gmail.com:993` and `smtp.gmail.com:465`, TLS only. A daily `git fetch` of this repository for the update check. |
 | **Secrets** | The app password lives only in the keyring (`secret-tool`): never in argv, a file or a log. Notifications go straight to D-Bus and codes are piped to `wl-copy`, so senders, subjects and codes never appear in process arguments. |
-| **Files** | Backend in `~/.local/lib/omamail/`, account settings in `~/.config/omamail/`, image, build and update caches in `~/.cache/omamail/`, service state in `~/.local/state/omamail/`, attachments in `$XDG_DOWNLOAD_DIR` (or `~/Downloads`). |
+| **Files** | Backend in `~/.local/lib/omamail/`, account settings in `~/.config/omamail/`, image, build and update caches in `~/.cache/omamail/`, service state and saved headers in `~/.local/state/omamail/`, attachments in `$XDG_DOWNLOAD_DIR` (or `~/Downloads`). |
 | **Desktop** | Launcher entry and icon in `~/.local/share/`; `omamail-watch.service`, `omamail-update-check.service` and `.timer` in `~/.config/systemd/user/`. |
 
 How mail is handled:
@@ -142,8 +147,8 @@ How mail is handled:
   not run.
 - **Verification codes** stay out of clipboard history, but do appear in
   Omarchy's notification history.
-- **Signing out** removes the password, the account settings and the
-  service state. Cached images stay until you remove them.
+- **Signing out** removes the password, the account settings, the service
+  state and the saved headers. Cached images stay until you remove them.
 
 ## Development
 

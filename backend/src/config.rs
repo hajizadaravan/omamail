@@ -13,7 +13,9 @@ fn xdg(var: &str, fallback: &str) -> PathBuf {
 }
 
 pub fn home() -> PathBuf {
-    std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("/"))
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/"))
 }
 
 pub fn config_dir() -> PathBuf {
@@ -33,10 +35,16 @@ pub fn cache_dir() -> PathBuf {
 pub fn private_cache(sub: &str) -> std::io::Result<PathBuf> {
     use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
     let root = cache_dir();
-    fs::DirBuilder::new().recursive(true).mode(0o700).create(&root)?;
+    fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&root)?;
     fs::set_permissions(&root, fs::Permissions::from_mode(0o700))?;
     let dir = root.join(sub);
-    fs::DirBuilder::new().recursive(true).mode(0o700).create(&dir)?;
+    fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&dir)?;
     Ok(dir)
 }
 
@@ -102,13 +110,17 @@ pub fn save_account(account: &Account) -> std::io::Result<()> {
 pub fn remove_account() {
     let _ = fs::remove_file(account_file());
     let _ = fs::remove_file(state_dir().join("watch.json"));
+    crate::listcache::clear();
 }
 
 /// Atomic write, readable only by the user.
 pub fn write_private(path: &Path, data: &[u8]) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
-        fs::DirBuilder::new().recursive(true).mode(0o700).create(parent)?;
+        fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(parent)?;
         fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?;
     }
     // Unique per writer: two threads may cache the same image at once.
@@ -117,7 +129,11 @@ pub fn write_private(path: &Path, data: &[u8]) -> std::io::Result<()> {
     let tmp = path.with_extension(format!("tmp.{}.{n}", std::process::id()));
     // A leftover temp file would keep its old mode; start from scratch.
     let _ = fs::remove_file(&tmp);
-    let mut file = fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&tmp)?;
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&tmp)?;
     file.write_all(data)?;
     file.sync_all()?;
     fs::rename(&tmp, path)

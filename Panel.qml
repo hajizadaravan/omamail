@@ -94,16 +94,24 @@ Item {
   property ListModel messages: ListModel {}
   property int total: 0
   property bool loadingList: false
+  property bool loadingMore: false
   property string listError: ""
   property string query: ""
   // The selection is tracked by UID; `cursor` is only its current row.
   property int selectedUid: -1
   property int cursor: -1
   property int listToken: 0
+  property int listValidity: 0
+  // False until this session's list reply confirms the mailbox. Saved rows
+  // are visible before that, but changing them (star, move) waits until confirmed.
+  property bool listLive: false
   property bool refreshPending: false
 
   property var view: null
   property string viewFolder: ""
+  // UIDVALIDITY the open message was fetched under. Later actions send this,
+  // not whatever the list learned afterwards.
+  property int viewValidity: 0
   property bool loadingView: false
   property string viewError: ""
   property int viewToken: 0
@@ -211,11 +219,14 @@ Item {
 
   function selectFolder(path) {
     if (draft) return
+    // Re-selecting the open folder refreshes in place. A different folder,
+    // or the first paint, starts from the saved headers.
+    var keep = path === folder && query.length === 0 && messages.count > 0
     folder = path
     setQuery("")
     view = null
     viewError = ""
-    loadList(true)
+    loadList(!keep)
   }
 
   function selectFolderBy(step) {
@@ -267,23 +278,41 @@ Item {
     if (listView() && listView().searchField.text !== text) listView().searchField.text = text
   }
 
-  // reset: a different folder or query, start empty. Otherwise refresh the
-  // newest page and keep older rows that were already loaded below it.
-  // quiet: a background refresh, whose failure is not worth a message.
+  // reset: a different folder or query. Saved headers paint first, then the
+  // server page replaces them. A refresh (reset false) keeps older rows
+  // loaded in this session when UIDVALIDITY still matches. quiet: a
+  // background refresh, whose failure is not worth a message.
   function loadList(reset, quiet) {
+    var token = ++listToken
+    var fromServer = false
     if (reset) {
       messages.clear()
       total = 0
       selectedUid = -1
       cursor = -1
+      listValidity = 0
+      listLive = false
     }
+    loadingMore = false
     // A background refresh keeps a shown error until it succeeds.
     if (!quiet) listError = ""
     loadingList = true
-    var token = ++listToken
     var searching = query.length > 0
+    if (reset && !searching) {
+      backend.request("cached", { folder: folder }, function(ok, data) {
+        if (token !== listToken || fromServer) return
+        if (!ok || !data || !data.messages || data.messages.length === 0) return
+        var rows = []
+        for (var i = 0; i < data.messages.length; i++) rows.push(flatten(data.messages[i]))
+        applyRows(rows)
+        total = data.total || rows.length
+        if (data.uidvalidity) listValidity = data.uidvalidity
+        syncCursor()
+      })
+    }
     backend.request(searching ? "search" : "list", { folder: folder, query: query }, function(ok, data, code) {
       if (token !== listToken) return
+      fromServer = true
       loadingList = false
       runPendingRefresh()
       if (!ok) {
@@ -294,10 +323,13 @@ Item {
       listError = ""
       var rows = []
       for (var i = 0; i < data.messages.length; i++) rows.push(flatten(data.messages[i]))
-      // Keep older loaded rows only if the new page reaches down to them;
-      // otherwise there would be a silent gap between the two.
+      // Saved rows are not scrollback. Keep older rows only when this
+      // session already confirmed the mailbox, and the new page reaches them.
+      var shownValidity = listValidity
+      var confirmed = listLive
       var overlaps = rows.length > 0 && messages.count > 0 && rows[rows.length - 1].uid <= messages.get(0).uid
-      if (!searching && !reset && overlaps) {
+      var sameMailbox = shownValidity !== 0 && data.uidvalidity === shownValidity
+      if (!searching && !reset && confirmed && overlaps && sameMailbox) {
         var oldest = rows[rows.length - 1].uid
         for (var j = 0; j < messages.count; j++) {
           var row = messages.get(j)
@@ -307,20 +339,27 @@ Item {
       }
       applyRows(rows)
       total = data.total
+      if (data.uidvalidity) listValidity = data.uidvalidity
+      listLive = true
       syncCursor()
     })
   }
 
   function loadMore() {
-    if (loadingList || query.length > 0 || messages.count === 0 || messages.count >= total) return
+    if (!listLive || loadingList || query.length > 0 || messages.count === 0 || messages.count >= total) return
     loadingList = true
+    loadingMore = true
     var token = ++listToken
     var before = messages.get(messages.count - 1).uid
     backend.request("list", { folder: folder, before_uid: before }, function(ok, data, code) {
       if (token !== listToken) return
       loadingList = false
+      loadingMore = false
       runPendingRefresh()
       if (!ok) return handleError(data, code)
+      if (data.uidvalidity && listValidity !== 0 && data.uidvalidity !== listValidity) {
+        return loadList(true)
+      }
       for (var i = 0; i < data.messages.length; i++) {
         var m = data.messages[i]
         if (indexOfUid(m.uid) < 0) messages.append(flatten(m))
@@ -378,6 +417,7 @@ Item {
 
   function openCurrent(images) {
     if (cursor < 0 || cursor >= messages.count) return
+    openTimer.stop()
     fetchMessage(folder, messages.get(cursor).uid, images === true)
   }
 
@@ -399,14 +439,34 @@ Item {
     return path === folder ? indexOfUid(uid) : -1
   }
 
+  // UIDVALIDITY to send with an action. An open message keeps the generation
+  // it was fetched under; a row uses the list the server just confirmed.
+  // Zero means "not confirmed", and the backend then skips the check.
+  function generationFor(path, uid) {
+    if (view && view.uid === uid && viewFolder === path && viewValidity) return viewValidity
+    return path === folder ? listValidity : 0
+  }
+
+  // Saved rows look final, but archive, trash, and flags must wait until
+  // the server list has confirmed them. An open message was fetched live.
+  function refuseStaleRow() {
+    if (view || listLive) return false
+    flash("Updating the list…")
+    return true
+  }
+
   function fetchMessage(path, uid, images) {
     var token = ++viewToken
     loadingView = true
     viewError = ""
-    if (!images) view = null
+    var validity = generationFor(path, uid)
+    if (!images) {
+      view = null
+      viewValidity = 0
+    }
     var before = rowFor(path, uid)
     var mark = before < 0 || !messages.get(before).seen
-    backend.request("open", { folder: path, uid: uid, images: images, mark: mark }, function(ok, data, code) {
+    backend.request("open", { folder: path, uid: uid, images: images, mark: mark, uidvalidity: validity }, function(ok, data, code) {
       if (token !== viewToken) return
       loadingView = false
       if (!ok) {
@@ -415,6 +475,7 @@ Item {
       }
       view = data
       viewFolder = path
+      viewValidity = data.uidvalidity || validity
       var index = rowFor(path, uid)
       currentFlagged = index >= 0 ? messages.get(index).flagged : false
       if (!images && index >= 0 && !messages.get(index).seen) {
@@ -446,10 +507,10 @@ Item {
 
   function toggleSeen() {
     var t = target()
-    if (!t) return
+    if (!t || refuseStaleRow()) return
     var i = rowFor(t.folder, t.uid)
     var on = i >= 0 ? !messages.get(i).seen : false
-    backend.request("flag", { folder: t.folder, uids: [t.uid], flag: "seen", on: on }, function(ok, data, code) {
+    backend.request("flag", { folder: t.folder, uids: [t.uid], flag: "seen", on: on, uidvalidity: generationFor(t.folder, t.uid) }, function(ok, data, code) {
       if (!ok) return handleError(data, code)
       var index = rowFor(t.folder, t.uid)
       if (index >= 0 && messages.get(index).seen !== on) {
@@ -462,10 +523,10 @@ Item {
 
   function toggleStar() {
     var t = target()
-    if (!t) return
+    if (!t || refuseStaleRow()) return
     var i = rowFor(t.folder, t.uid)
     var on = i >= 0 ? !messages.get(i).flagged : !currentFlagged
-    backend.request("flag", { folder: t.folder, uids: [t.uid], flag: "flagged", on: on }, function(ok, data, code) {
+    backend.request("flag", { folder: t.folder, uids: [t.uid], flag: "flagged", on: on, uidvalidity: generationFor(t.folder, t.uid) }, function(ok, data, code) {
       if (!ok) return handleError(data, code)
       var index = rowFor(t.folder, t.uid)
       if (index >= 0) messages.setProperty(index, "flagged", on)
@@ -480,9 +541,10 @@ Item {
     if (role === "all" && fromRole !== "inbox" && fromRole !== "") return
     if (role === "trash" && fromRole === "trash") return
     if (role === "inbox" && fromRole !== "trash" && fromRole !== "junk") return
+    if (refuseStaleRow()) return
     var i = rowFor(t.folder, t.uid)
     var wasUnseen = i >= 0 && !messages.get(i).seen
-    backend.request("move", { folder: t.folder, uids: [t.uid], to: role }, function(ok, data, code) {
+    backend.request("move", { folder: t.folder, uids: [t.uid], to: role, uidvalidity: generationFor(t.folder, t.uid) }, function(ok, data, code) {
       if (!ok) return handleError(data, code)
       if (view && view.uid === t.uid && viewFolder === t.folder) view = null
       var index = rowFor(t.folder, t.uid)
@@ -503,7 +565,7 @@ Item {
 
   function saveAttachment(index, openAfter) {
     if (!view) return
-    backend.request("attachment", { folder: viewFolder, uid: view.uid, index: index, open: openAfter }, function(ok, data, code) {
+    backend.request("attachment", { folder: viewFolder, uid: view.uid, index: index, open: openAfter, uidvalidity: generationFor(viewFolder, view.uid) }, function(ok, data, code) {
       if (!ok) return handleError(data, code)
       if (openAfter && !data.opened) flash("Saved " + data.path + " (not opened: this file type could run code)")
       else flash("Saved " + data.path)
@@ -528,10 +590,12 @@ Item {
     if (!view) return
     var uid = view.uid
     var source = viewFolder
-    backend.request("draft", { folder: source, uid: uid, mode: mode }, function(ok, data, code) {
+    var validity = generationFor(source, uid)
+    backend.request("draft", { folder: source, uid: uid, mode: mode, uidvalidity: validity }, function(ok, data, code) {
       if (!ok) return handleError(data, code)
       data.forward_folder = mode === "forward" ? source : ""
       data.forward_uid = mode === "forward" ? uid : 0
+      data.uidvalidity = mode === "forward" ? validity : 0
       draft = data
     })
   }

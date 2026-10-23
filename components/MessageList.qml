@@ -159,12 +159,15 @@ Item {
     }
 
     footer: Item {
+      // A list already on screen updates without a "Loading…" row. The
+      // footer stays for the empty list and for an older page.
+      readonly property bool showLoading: (root.app.loadingList && list.count === 0) || root.app.loadingMore
       width: ListView.view ? ListView.view.width : 0
-      height: root.app.loadingList ? Style.space(36) : 0
+      height: showLoading ? Style.space(36) : 0
       Text {
         textFormat: Text.PlainText
         anchors.centerIn: parent
-        visible: root.app.loadingList
+        visible: parent.showLoading
         text: "Loading…"
         color: root.muted
         font.family: Style.font.family

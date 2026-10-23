@@ -47,10 +47,10 @@ pub fn fetch_all(urls: &[String]) -> HashMap<String, PathBuf> {
                 loop {
                     let i = next.fetch_add(1, Ordering::Relaxed);
                     let Some(url) = urls.get(i) else { break };
-                    if let Some(path) = cached_or_fetch(&agent, url, &dir) {
-                        if let Ok(mut map) = found.lock() {
-                            map.insert((*url).clone(), path);
-                        }
+                    if let Some(path) = cached_or_fetch(&agent, url, &dir)
+                        && let Ok(mut map) = found.lock()
+                    {
+                        map.insert((*url).clone(), path);
                     }
                 }
             });
@@ -100,9 +100,7 @@ impl Resolver for PublicOnly {
 fn download(agent: &ureq::Agent, url: &str) -> Option<Vec<u8>> {
     let mut current = url.to_string();
     for _ in 0..=MAX_REDIRECTS {
-        if host_port(&current).is_none() {
-            return None;
-        }
+        host_port(&current)?;
         let mut response = agent.get(&current).call().ok()?;
         let status = response.status().as_u16();
         if (300..400).contains(&status) {

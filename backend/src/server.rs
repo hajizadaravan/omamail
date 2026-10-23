@@ -1,7 +1,8 @@
 //! `omamail serve`: the backend the QML window talks to.
 //!
 //! Protocol: one JSON object per line on stdin/stdout.
-//!   request  {"id": 1, "cmd": "list", "folder": "INBOX", "page": 0}
+//!   request  {"id": 1, "cmd": "list", "folder": "INBOX", "before_uid": 0}
+//!   request  {"id": 2, "cmd": "cached", "folder": "INBOX"}
 //!   reply    {"id": 1, "ok": true, "data": ...} | {"id": 1, "ok": false, "code": "auth", "error": "..."}
 //!   event    {"event": "changed", "folder": "INBOX"}
 //! Requests run one at a time on a worker thread that owns the IMAP
@@ -22,7 +23,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
-const PAGE_SIZE: u32 = 50;
+/// The newest page, and the on-disk cache, are the same window: the list
+/// paints from disk and this reply updates those rows in place.
+const PAGE_SIZE: u32 = crate::listcache::LIMIT as u32;
 const IDLE_TIMEOUT: Duration = Duration::from_secs(9 * 60);
 const RAW_CACHE: usize = 6;
 
@@ -45,19 +48,48 @@ struct Failure {
 
 impl From<MailError> for Failure {
     fn from(e: MailError) -> Self {
-        let code = if matches!(e, MailError::Auth) { "auth" } else { "error" };
-        Failure { code, message: e.to_string() }
+        let code = if matches!(e, MailError::Auth) {
+            "auth"
+        } else {
+            "error"
+        };
+        Failure {
+            code,
+            message: e.to_string(),
+        }
     }
 }
 
 fn fail(message: impl Into<String>) -> Failure {
-    Failure { code: "error", message: message.into() }
+    Failure {
+        code: "error",
+        message: message.into(),
+    }
 }
 
 type Reply = Result<Value, Failure>;
 
 fn str_arg<'a>(req: &'a Value, key: &str) -> Result<&'a str, Failure> {
-    req.get(key).and_then(Value::as_str).ok_or_else(|| fail(format!("missing {key}")))
+    req.get(key)
+        .and_then(Value::as_str)
+        .ok_or_else(|| fail(format!("missing {key}")))
+}
+
+/// The generation the body was actually read under, so later flag, move,
+/// and forward requests can be refused after the mailbox is rebuilt.
+fn stamp_validity(mut view: Value, validity: u32) -> Value {
+    if let Some(obj) = view.as_object_mut() {
+        obj.insert("uidvalidity".to_string(), json!(validity));
+    }
+    view
+}
+
+/// Absent or unparsable means "the client has not learned UIDVALIDITY".
+fn optional_u32(req: &Value, key: &str) -> u32 {
+    req.get(key)
+        .and_then(Value::as_u64)
+        .and_then(|n| u32::try_from(n).ok())
+        .unwrap_or(0)
 }
 
 fn u32_arg(req: &Value, key: &str) -> Result<u32, Failure> {
@@ -68,9 +100,16 @@ fn u32_arg(req: &Value, key: &str) -> Result<u32, Failure> {
 }
 
 fn uids_arg(req: &Value) -> Result<Vec<u32>, Failure> {
-    let list = req.get("uids").and_then(Value::as_array).ok_or_else(|| fail("missing uids"))?;
+    let list = req
+        .get("uids")
+        .and_then(Value::as_array)
+        .ok_or_else(|| fail("missing uids"))?;
     list.iter()
-        .map(|v| v.as_u64().and_then(|n| u32::try_from(n).ok()).ok_or_else(|| fail("bad uid")))
+        .map(|v| {
+            v.as_u64()
+                .and_then(|n| u32::try_from(n).ok())
+                .ok_or_else(|| fail("bad uid"))
+        })
         .collect()
 }
 
@@ -84,13 +123,21 @@ struct Session {
 struct Server {
     out: Out,
     session: Option<Session>,
-    raw_cache: VecDeque<((String, u32), Vec<u8>)>,
+    /// Body cache keyed by folder, UID, and the UIDVALIDITY it was fetched
+    /// under. A rebuilt mailbox reuses UIDs, so a hit under another
+    /// generation would show the wrong message.
+    raw_cache: VecDeque<((String, u32, u32), Vec<u8>)>,
 }
 
 impl Server {
     fn start_session(&mut self, account: Account, password: String) {
         let idle_stop = Arc::new(AtomicBool::new(false));
-        spawn_idle(account.clone(), password.clone(), self.out.clone(), Arc::clone(&idle_stop));
+        spawn_idle(
+            account.clone(),
+            password.clone(),
+            self.out.clone(),
+            Arc::clone(&idle_stop),
+        );
         self.session = Some(Session {
             mailbox: Mailbox::new(account.clone(), password.clone()),
             account,
@@ -108,24 +155,62 @@ impl Server {
     }
 
     fn session(&mut self) -> Result<&mut Session, Failure> {
-        self.session.as_mut().ok_or(Failure { code: "not_configured", message: "Sign in first".into() })
+        self.session.as_mut().ok_or(Failure {
+            code: "not_configured",
+            message: "Sign in first".into(),
+        })
     }
 
-    fn raw(&mut self, folder: &str, uid: u32, mark_seen: bool) -> Result<Vec<u8>, Failure> {
-        let key = (folder.to_string(), uid);
-        if let Some((_, raw)) = self.raw_cache.iter().find(|(k, _)| *k == key) {
-            let raw = raw.clone();
-            // The UI asks for this only when its row is still unread.
-            if mark_seen {
-                self.session()?.mailbox.set_flag(folder, &[uid], "seen", true)?;
+    fn raw(
+        &mut self,
+        folder: &str,
+        uid: u32,
+        mark_seen: bool,
+        expected_validity: u32,
+    ) -> Result<Vec<u8>, Failure> {
+        // Unknown generation must not alias a real one, and must not be stored.
+        if expected_validity != 0 {
+            let key = (folder.to_string(), uid, expected_validity);
+            if let Some(index) = self.raw_cache.iter().position(|(k, _)| *k == key) {
+                let current = self.session()?.mailbox.validity_if_selected(folder);
+                if current.is_none() || current == Some(expected_validity) {
+                    let raw = self.raw_cache[index].1.clone();
+                    // The UI asks for this only when its row is still unread.
+                    if mark_seen {
+                        self.session()?.mailbox.set_flag(
+                            folder,
+                            &[uid],
+                            "seen",
+                            true,
+                            expected_validity,
+                        )?;
+                    }
+                    return Ok(raw);
+                }
+                // A different number for this folder means the body is from
+                // before a rebuild.
+                self.raw_cache.remove(index);
             }
-            return Ok(raw);
         }
-        let raw = self.session()?.mailbox.fetch_raw(folder, uid, mark_seen)?;
-        if self.raw_cache.len() >= RAW_CACHE {
-            self.raw_cache.pop_front();
+        let raw = self
+            .session()?
+            .mailbox
+            .fetch_raw(folder, uid, mark_seen, expected_validity)?;
+        let validity = if expected_validity != 0 {
+            expected_validity
+        } else {
+            self.session()?.mailbox.uidvalidity()
+        };
+        if validity != 0 {
+            let key = (folder.to_string(), uid, validity);
+            if let Some(index) = self.raw_cache.iter().position(|(k, _)| *k == key) {
+                self.raw_cache.remove(index);
+            }
+            if self.raw_cache.len() >= RAW_CACHE {
+                self.raw_cache.pop_front();
+            }
+            self.raw_cache.push_back((key, raw.clone()));
         }
-        self.raw_cache.push_back((key, raw.clone()));
         Ok(raw)
     }
 
@@ -149,7 +234,9 @@ impl Server {
         match cmd {
             "status" => Ok(match &self.session {
                 Some(s) => json!({"configured": true, "email": s.account.email}),
-                None => json!({"configured": false, "email": config::load_account().map(|a| a.email)}),
+                None => {
+                    json!({"configured": false, "email": config::load_account().map(|a| a.email)})
+                }
             }),
             "login" => self.login(req),
             "logout" => {
@@ -161,34 +248,59 @@ impl Server {
                 config::remove_account();
                 Ok(Value::Null)
             }
-            "folders" => self.session().and_then(|s| Ok(json!(s.mailbox.folders(true)?))),
+            "folders" => self
+                .session()
+                .and_then(|s| Ok(json!(s.mailbox.folders(true)?))),
             "unread" => {
                 let folder = str_arg(req, "folder")?.to_string();
-                self.session().and_then(|s| Ok(json!(s.mailbox.unread(&folder)?)))
+                self.session()
+                    .and_then(|s| Ok(json!(s.mailbox.unread(&folder)?)))
             }
             "list" => {
                 let folder = str_arg(req, "folder")?.to_string();
                 let before = u32_arg(req, "before_uid").unwrap_or(0);
-                self.session().and_then(|s| Ok(json!(s.mailbox.page(&folder, before, PAGE_SIZE)?)))
+                let page = self
+                    .session()
+                    .and_then(|s| Ok(s.mailbox.page(&folder, before, PAGE_SIZE)?))?;
+                // Older pages ("load more") stay out of the cache: storing
+                // them would replace the newest headers the window opens on.
+                if before == 0 {
+                    let email = self.session()?.account.email.clone();
+                    crate::listcache::store(&email, &folder, &page);
+                }
+                Ok(json!(page))
+            }
+            "cached" => {
+                let folder = str_arg(req, "folder")?.to_string();
+                let email = self.session()?.account.email.clone();
+                Ok(json!(crate::listcache::load(&email, &folder)))
             }
             "search" => {
                 let folder = str_arg(req, "folder")?.to_string();
                 let query = str_arg(req, "query")?.to_string();
-                self.session().and_then(|s| Ok(json!(s.mailbox.search(&folder, &query, 100)?)))
+                self.session()
+                    .and_then(|s| Ok(json!(s.mailbox.search(&folder, &query, 100)?)))
             }
             "open" => {
                 let folder = str_arg(req, "folder")?.to_string();
                 let uid = u32_arg(req, "uid")?;
                 let mark = req.get("mark").and_then(Value::as_bool).unwrap_or(true);
-                self.raw(&folder, uid, mark).map(|raw| json!(message::render(&raw, uid, false)))
+                let validity = optional_u32(req, "uidvalidity");
+                let raw = self.raw(&folder, uid, mark, validity)?;
+                let observed = self.session()?.mailbox.uidvalidity();
+                Ok(stamp_validity(
+                    json!(message::render(&raw, uid, false)),
+                    observed,
+                ))
             }
             "flag" => {
                 let folder = str_arg(req, "folder")?.to_string();
                 let flag = str_arg(req, "flag")?.to_string();
                 let on = req.get("on").and_then(Value::as_bool).unwrap_or(true);
                 let uids = uids_arg(req)?;
+                let validity = optional_u32(req, "uidvalidity");
                 self.session().and_then(|s| {
-                    s.mailbox.set_flag(&folder, &uids, &flag, on)?;
+                    s.mailbox.set_flag(&folder, &uids, &flag, on, validity)?;
                     Ok(Value::Null)
                 })
             }
@@ -198,9 +310,12 @@ impl Server {
                 let folder = str_arg(req, "folder")?.to_string();
                 let uid = u32_arg(req, "uid")?;
                 let mode = str_arg(req, "mode")?.to_string();
+                let validity = optional_u32(req, "uidvalidity");
                 let me = self.session()?.account.email.clone();
-                let raw = self.raw(&folder, uid, false)?;
-                message::draft(&raw, &mode, &me).map(|d| json!(d)).ok_or_else(|| fail("Could not read the message"))
+                let raw = self.raw(&folder, uid, false, validity)?;
+                message::draft(&raw, &mode, &me)
+                    .map(|d| json!(d))
+                    .ok_or_else(|| fail("Could not read the message"))
             }
             other => Err(fail(format!("unknown command {other}"))),
         }
@@ -208,7 +323,10 @@ impl Server {
 
     fn login(&mut self, req: &Value) -> Reply {
         let email = str_arg(req, "email")?.trim().to_string();
-        let password: String = str_arg(req, "password")?.chars().filter(|c| !c.is_whitespace()).collect();
+        let password: String = str_arg(req, "password")?
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
         if !email.contains('@') || email.contains(char::is_whitespace) {
             return Err(fail("Enter your full Gmail address"));
         }
@@ -220,7 +338,9 @@ impl Server {
         probe.connect()?;
         probe.close();
         secret::store(&email, &password).map_err(fail)?;
-        config::save_account(&account).map_err(|e| fail(format!("Could not save settings: {e}")))?;
+        config::save_account(&account)
+            .map_err(|e| fail(format!("Could not save settings: {e}")))?;
+        crate::listcache::retain(&email);
         self.end_session();
         self.start_session(account, password);
         watcher("restart");
@@ -239,8 +359,10 @@ impl Server {
         if dest == folder {
             return Err(fail("The message is already there"));
         }
-        s.mailbox.move_to(&folder, &uids, &dest)?;
-        self.raw_cache.retain(|((f, u), _)| !(f == &folder && uids.contains(u)));
+        let validity = optional_u32(req, "uidvalidity");
+        s.mailbox.move_to(&folder, &uids, &dest, validity)?;
+        self.raw_cache
+            .retain(|((f, u, _), _)| !(f == &folder && uids.contains(u)));
         Ok(Value::Null)
     }
 
@@ -249,8 +371,9 @@ impl Server {
         let uid = u32_arg(req, "uid")?;
         let index = u32_arg(req, "index")? as usize;
         let open = req.get("open").and_then(Value::as_bool).unwrap_or(false);
-        let raw = self.raw(&folder, uid, false)?;
-        let (name, bytes) = message::attachment(&raw, index).ok_or_else(|| fail("Attachment not found"))?;
+        let raw = self.raw(&folder, uid, false, optional_u32(req, "uidvalidity"))?;
+        let (name, bytes) =
+            message::attachment(&raw, index).ok_or_else(|| fail("Attachment not found"))?;
         let path = write_unique(&config::download_dir(), &name, &bytes)
             .map_err(|e| fail(format!("Could not save {name}: {e}")))?;
         let opened = open && safe_to_open(&path) && content_is_viewable(&path);
@@ -277,13 +400,14 @@ impl Server {
             Ok(u) => u,
             Err(e) => return Some(Err(e)),
         };
-        let raw = match self.raw(&folder, uid, false) {
+        let raw = match self.raw(&folder, uid, false, optional_u32(req, "uidvalidity")) {
             Ok(raw) => raw,
             Err(e) => return Some(Err(e)),
         };
+        let observed = self.session().map(|s| s.mailbox.uidvalidity()).unwrap_or(0);
         let out = self.out.clone();
         std::thread::spawn(move || {
-            let view = message::render(&raw, uid, true);
+            let view = stamp_validity(json!(message::render(&raw, uid, true)), observed);
             out.emit(&json!({"id": id, "ok": true, "data": view}));
         });
         None
@@ -298,7 +422,12 @@ impl Server {
             Err(e) => return Some(Err(fail(format!("bad message: {e}")))),
         };
         let forwarded = if outgoing.forward_uid > 0 {
-            match self.raw(&outgoing.forward_folder, outgoing.forward_uid, false) {
+            match self.raw(
+                &outgoing.forward_folder,
+                outgoing.forward_uid,
+                false,
+                optional_u32(req, "uidvalidity"),
+            ) {
                 Ok(raw) => message::all_attachments(&raw),
                 Err(e) => return Some(Err(e)),
             }
@@ -326,9 +455,9 @@ impl Server {
 /// .html, .svg) is only saved, never opened.
 fn safe_to_open(path: &std::path::Path) -> bool {
     const VIEWABLE: &[&str] = &[
-        "pdf", "png", "jpg", "jpeg", "gif", "webp", "bmp", "heic", "txt", "csv", "md", "mp3", "m4a", "ogg", "opus",
-        "wav", "flac", "mp4", "m4v", "mkv", "webm", "mov", "avi", "odt", "ods", "odp", "docx", "xlsx", "pptx", "doc",
-        "xls", "ppt", "zip", "epub",
+        "pdf", "png", "jpg", "jpeg", "gif", "webp", "bmp", "heic", "txt", "csv", "md", "mp3",
+        "m4a", "ogg", "opus", "wav", "flac", "mp4", "m4v", "mkv", "webm", "mov", "avi", "odt",
+        "ods", "odp", "docx", "xlsx", "pptx", "doc", "xls", "ppt", "zip", "epub",
     ];
     path.extension()
         .and_then(|e| e.to_str())
@@ -339,7 +468,12 @@ fn safe_to_open(path: &std::path::Path) -> bool {
 /// "invoice.pdf" opens in java), so the content type is checked too, with
 /// the same tool xdg-open itself asks.
 fn content_is_viewable(path: &std::path::Path) -> bool {
-    let Ok(out) = Command::new("xdg-mime").args(["query", "filetype"]).arg(path).stderr(Stdio::null()).output() else {
+    let Ok(out) = Command::new("xdg-mime")
+        .args(["query", "filetype"])
+        .arg(path)
+        .stderr(Stdio::null())
+        .output()
+    else {
         return false;
     };
     out.status.success() && viewable_mime(String::from_utf8_lossy(&out.stdout).trim())
@@ -347,12 +481,27 @@ fn content_is_viewable(path: &std::path::Path) -> bool {
 
 fn viewable_mime(mime: &str) -> bool {
     const EXACT: &[&str] = &[
-        "application/pdf", "image/png", "image/jpeg", "image/gif", "image/webp", "image/bmp", "image/heic",
-        "text/plain", "text/csv", "text/markdown", "application/zip", "application/epub+zip", "application/msword",
-        "application/vnd.ms-excel", "application/vnd.ms-powerpoint",
+        "application/pdf",
+        "image/png",
+        "image/jpeg",
+        "image/gif",
+        "image/webp",
+        "image/bmp",
+        "image/heic",
+        "text/plain",
+        "text/csv",
+        "text/markdown",
+        "application/zip",
+        "application/epub+zip",
+        "application/msword",
+        "application/vnd.ms-excel",
+        "application/vnd.ms-powerpoint",
     ];
     const PREFIX: &[&str] = &[
-        "audio/", "video/", "application/vnd.oasis.opendocument.", "application/vnd.openxmlformats-officedocument.",
+        "audio/",
+        "video/",
+        "application/vnd.oasis.opendocument.",
+        "application/vnd.openxmlformats-officedocument.",
     ];
     EXACT.contains(&mime) || PREFIX.iter().any(|p| mime.starts_with(p))
 }
@@ -381,8 +530,16 @@ fn write_unique(dir: &std::path::Path, name: &str, bytes: &[u8]) -> std::io::Res
         _ => (name, ""),
     };
     for n in 1..1000 {
-        let candidate = if n == 1 { dir.join(name) } else { dir.join(format!("{stem} ({n}){ext}")) };
-        match std::fs::OpenOptions::new().write(true).create_new(true).open(&candidate) {
+        let candidate = if n == 1 {
+            dir.join(name)
+        } else {
+            dir.join(format!("{stem} ({n}){ext}"))
+        };
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
             Ok(mut f) => {
                 f.write_all(bytes)?;
                 return Ok(candidate);
@@ -404,12 +561,13 @@ fn spawn_idle(account: Account, password: String, out: Out, stop: Arc<AtomicBool
         let mut mailbox = Mailbox::new(account, password);
         let mut backoff = liveness::Backoff::new(120);
         let mut seen: Option<(u32, u32)> = None;
-        let mut woke = true;
+        let mut woke = false;
         while !stop.load(Ordering::Relaxed) {
             let kicks = liveness::kicks();
             let started = Instant::now();
             let result = mailbox.counts("INBOX").and_then(|now| {
-                if (woke || seen != Some(now)) && !stop.load(Ordering::Relaxed) {
+                if (woke || (seen.is_some() && seen != Some(now))) && !stop.load(Ordering::Relaxed)
+                {
                     out.emit(&json!({"event": "changed", "folder": "INBOX"}));
                 }
                 seen = Some(now);
@@ -444,16 +602,22 @@ pub fn run() {
     let (tx, rx) = mpsc::channel::<Value>();
     let worker_out = out.clone();
     std::thread::spawn(move || {
-        let mut server = Server { out: worker_out.clone(), session: None, raw_cache: VecDeque::new() };
+        let mut server = Server {
+            out: worker_out.clone(),
+            session: None,
+            raw_cache: VecDeque::new(),
+        };
         // The demo build answers from fixtures: no account, no connection.
-        if let Some(account) = config::load_account().filter(|_| !cfg!(feature = "demo")) {
-            if let Some(password) = secret::lookup(&account.email) {
-                server.start_session(account, password);
-            }
+        if let Some(account) = config::load_account().filter(|_| !cfg!(feature = "demo"))
+            && let Some(password) = secret::lookup(&account.email)
+        {
+            server.start_session(account, password);
         }
         for req in rx {
             let id = req.get("id").cloned().unwrap_or(Value::Null);
-            let Some(reply) = server.handle(&req) else { continue };
+            let Some(reply) = server.handle(&req) else {
+                continue;
+            };
             let value = match reply {
                 Ok(data) => json!({"id": id, "ok": true, "data": data}),
                 Err(f) => json!({"id": id, "ok": false, "code": f.code, "error": f.message}),
@@ -488,19 +652,37 @@ mod tests {
         use std::path::Path;
         assert!(safe_to_open(Path::new("/d/report.PDF")));
         assert!(safe_to_open(Path::new("/d/clip.mp4")));
-        for bad in ["x.desktop", "x.sh", "x.jar", "x.html", "x.svg", "x.AppImage", "noext", "pdf"] {
+        for bad in [
+            "x.desktop",
+            "x.sh",
+            "x.jar",
+            "x.html",
+            "x.svg",
+            "x.AppImage",
+            "noext",
+            "pdf",
+        ] {
             assert!(!safe_to_open(Path::new(bad)), "{bad}");
         }
     }
 
     #[test]
     fn content_types_that_run_code_are_refused() {
-        for ok in ["application/pdf", "video/mp4", "application/vnd.openxmlformats-officedocument.wordprocessingml.document"] {
+        for ok in [
+            "application/pdf",
+            "video/mp4",
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        ] {
             assert!(viewable_mime(ok), "{ok}");
         }
         for bad in [
-            "application/java-archive", "application/x-desktop", "text/x-shellscript", "text/html",
-            "image/svg+xml", "application/x-executable", "",
+            "application/java-archive",
+            "application/x-desktop",
+            "text/x-shellscript",
+            "text/html",
+            "image/svg+xml",
+            "application/x-executable",
+            "",
         ] {
             assert!(!viewable_mime(bad), "{bad}");
         }
