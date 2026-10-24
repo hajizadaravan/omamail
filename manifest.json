@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "reavann.omamail",
   "name": "Omamail",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "author": "Ravan Hajizada",
   "license": "MIT",
   "description": "A light Gmail client in the Omarchy shell. Open with: omarchy-shell shell toggle reavann.omamail '{}'",

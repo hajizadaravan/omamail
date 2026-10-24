@@ -64,14 +64,35 @@ pub fn store(email: &str, folder: &str, page: &Page) {
 }
 
 pub fn clear() {
-    let _ = fs::remove_file(path());
+    clear_at(&path());
 }
 
-/// Forgets the file when it belongs to another account. Signing in as
-/// someone else must not leave the previous subjects on disk until the
-/// next list happens to overwrite them.
+/// Forgets the file unless it is this account's. Signing in as someone
+/// else must not leave the previous subjects on disk until the next list
+/// happens to overwrite them, even in a file this version cannot read.
 pub fn retain(email: &str) {
     drop_other(&path(), email);
+}
+
+/// Also removes temp files of a write the process did not live to rename.
+fn clear_at(path: &Path) {
+    let _ = fs::remove_file(path);
+    let (Some(dir), Some(stem)) = (path.parent(), path.file_stem().and_then(|s| s.to_str())) else {
+        return;
+    };
+    let prefix = format!("{stem}.tmp.");
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if entry
+            .file_name()
+            .to_str()
+            .is_some_and(|n| n.starts_with(&prefix))
+        {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
 }
 
 fn now() -> u64 {
@@ -183,10 +204,8 @@ fn write_at(path: &Path, email: &str, folder: &str, page: &Page) {
 }
 
 fn drop_other(path: &Path, email: &str) {
-    if let Some(store) = read_store(path)
-        && store.email != email
-    {
-        let _ = fs::remove_file(path);
+    if read_store(path).is_none_or(|s| s.email != email) {
+        clear_at(path);
     }
 }
 
@@ -329,6 +348,16 @@ mod tests {
         drop_other(&path, "b@ex.com");
         assert!(read_at(&path, "a@ex.com", "INBOX").messages.is_empty());
         assert!(!path.exists());
+
+        // An unreadable file and a write cut off before its rename are
+        // gone too, but nothing else in the folder is.
+        fs::write(&path, b"not json").unwrap();
+        let tmp = dir.join("list.tmp.1.0");
+        fs::write(&tmp, b"partial").unwrap();
+        fs::write(dir.join("watch.json"), b"{}").unwrap();
+        drop_other(&path, "a@ex.com");
+        assert!(!path.exists() && !tmp.exists());
+        assert!(dir.join("watch.json").exists());
         let _ = fs::remove_dir_all(dir);
     }
 

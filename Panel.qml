@@ -157,6 +157,10 @@ Item {
       busy = false
       if (!ok) { signInError = data; return }
       email = data.email
+      // Rows left by an auth error may be another account's: start empty,
+      // or selectFolder would refresh them in place as if confirmed.
+      messages.clear()
+      view = null
       enterMail()
     })
   }
@@ -224,8 +228,7 @@ Item {
     var keep = path === folder && query.length === 0 && messages.count > 0
     folder = path
     setQuery("")
-    view = null
-    viewError = ""
+    dropView()
     loadList(!keep)
   }
 
@@ -368,9 +371,17 @@ Item {
     })
   }
 
+  // Closes the reader, and an open still on its way must not reopen it.
+  function dropView() {
+    ++viewToken
+    loadingView = false
+    view = null
+    viewError = ""
+  }
+
   function search(text) {
     setQuery(text.trim())
-    view = null
+    dropView()
     loadList(true)
     if (query.length > 0) focusList()
   }
@@ -448,9 +459,13 @@ Item {
   }
 
   // Saved rows look final, but archive, trash, and flags must wait until
-  // the server list has confirmed them. An open message was fetched live.
-  function refuseStaleRow() {
-    if (view || listLive) return false
+  // the server list has confirmed them. An open message was fetched live,
+  // but its seen and starred state still comes from the row: a toggle
+  // (usesFlags) waits even then, or it would flip the saved value.
+  // A list that failed is asked for again, or the wait would never end.
+  function refuseStaleRow(usesFlags) {
+    if (listLive || (view && !usesFlags)) return false
+    if (!loadingList) loadList(false)
     flash("Updating the list…")
     return true
   }
@@ -465,7 +480,8 @@ Item {
       viewValidity = 0
     }
     var before = rowFor(path, uid)
-    var mark = before < 0 || !messages.get(before).seen
+    // A saved row may say "seen" for mail marked unread since.
+    var mark = before < 0 || !listLive || !messages.get(before).seen
     backend.request("open", { folder: path, uid: uid, images: images, mark: mark, uidvalidity: validity }, function(ok, data, code) {
       if (token !== viewToken) return
       loadingView = false
@@ -507,7 +523,7 @@ Item {
 
   function toggleSeen() {
     var t = target()
-    if (!t || refuseStaleRow()) return
+    if (!t || refuseStaleRow(true)) return
     var i = rowFor(t.folder, t.uid)
     var on = i >= 0 ? !messages.get(i).seen : false
     backend.request("flag", { folder: t.folder, uids: [t.uid], flag: "seen", on: on, uidvalidity: generationFor(t.folder, t.uid) }, function(ok, data, code) {
@@ -523,7 +539,7 @@ Item {
 
   function toggleStar() {
     var t = target()
-    if (!t || refuseStaleRow()) return
+    if (!t || refuseStaleRow(true)) return
     var i = rowFor(t.folder, t.uid)
     var on = i >= 0 ? !messages.get(i).flagged : !currentFlagged
     backend.request("flag", { folder: t.folder, uids: [t.uid], flag: "flagged", on: on, uidvalidity: generationFor(t.folder, t.uid) }, function(ok, data, code) {
@@ -541,7 +557,7 @@ Item {
     if (role === "all" && fromRole !== "inbox" && fromRole !== "") return
     if (role === "trash" && fromRole === "trash") return
     if (role === "inbox" && fromRole !== "trash" && fromRole !== "junk") return
-    if (refuseStaleRow()) return
+    if (refuseStaleRow(false)) return
     var i = rowFor(t.folder, t.uid)
     var wasUnseen = i >= 0 && !messages.get(i).seen
     backend.request("move", { folder: t.folder, uids: [t.uid], to: role, uidvalidity: generationFor(t.folder, t.uid) }, function(ok, data, code) {

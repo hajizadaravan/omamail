@@ -823,11 +823,6 @@ impl Mailbox {
 
     // ------------------------------------------------------------- messages
 
-    /// UIDVALIDITY from the last SELECT on this connection. Zero before that.
-    pub fn uidvalidity(&self) -> u32 {
-        self.uidvalidity
-    }
-
     /// That value only if `path` is the folder currently selected. Another
     /// folder can use the same number, so a body cached for `path` must not
     /// be trusted just because the number matches.
@@ -865,9 +860,11 @@ impl Mailbox {
                 "(UID FLAGS BODY.PEEK[])"
             };
             let fetches = mb.session()?.uid_fetch(uid.to_string(), query)?;
+            // BODY[] sets \Seen, and the server may report that as a
+            // separate FETCH without the body.
             let found = fetches
                 .iter()
-                .find(|f| f.uid == Some(uid))
+                .find(|f| f.uid == Some(uid) && f.body().is_some())
                 .ok_or(MailError::Gone)?;
             let raw = found.body().map(<[u8]>::to_vec).ok_or(MailError::Gone)?;
             Ok(raw)

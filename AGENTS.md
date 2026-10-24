@@ -39,7 +39,9 @@ there: `omarchy plugin update` may `git reset --hard` it.
   only when necessary, with the lockfile change in the same commit.
 - **The app password stays in the keyring.** Never put it, mail text or
   verification codes in argv, logs or files (codes go to the 0600 state
-  file, `wl-copy` via stdin, notifications over D-Bus directly).
+  file, `wl-copy` via stdin, notifications over D-Bus directly). The one
+  other file is the 0600 header cache (`listcache.rs`): subjects and
+  senders, never bodies, deleted on sign-out.
 - **Mail is hostile input.** HTML only through `sanitize.rs`; subjects and
   names are plain text in QML and markup-escaped in notification bodies
   (the summary is shown as plain text: don't escape it). Remote images:

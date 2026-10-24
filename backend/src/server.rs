@@ -161,6 +161,20 @@ impl Server {
         })
     }
 
+    /// The generation a body from `raw` belongs to. A nonzero `expected` was
+    /// checked there (by the cache key or against the SELECT); otherwise
+    /// `raw` just selected `folder`. The last SELECT alone may be another
+    /// folder's, or stale after a dropped connection.
+    fn generation(&mut self, folder: &str, expected: u32) -> u32 {
+        if expected != 0 {
+            return expected;
+        }
+        self.session()
+            .ok()
+            .and_then(|s| s.mailbox.validity_if_selected(folder))
+            .unwrap_or(0)
+    }
+
     fn raw(
         &mut self,
         folder: &str,
@@ -175,15 +189,17 @@ impl Server {
                 let current = self.session()?.mailbox.validity_if_selected(folder);
                 if current.is_none() || current == Some(expected_validity) {
                     let raw = self.raw_cache[index].1.clone();
-                    // The UI asks for this only when its row is still unread.
+                    // The UI asks for this when its row is unread or only
+                    // saved. The body is in memory, so a failed mark (offline)
+                    // must not fail the open; the next list shows the flag.
                     if mark_seen {
-                        self.session()?.mailbox.set_flag(
+                        let _ = self.session()?.mailbox.set_flag(
                             folder,
                             &[uid],
                             "seen",
                             true,
                             expected_validity,
-                        )?;
+                        );
                     }
                     return Ok(raw);
                 }
@@ -196,11 +212,7 @@ impl Server {
             .session()?
             .mailbox
             .fetch_raw(folder, uid, mark_seen, expected_validity)?;
-        let validity = if expected_validity != 0 {
-            expected_validity
-        } else {
-            self.session()?.mailbox.uidvalidity()
-        };
+        let validity = self.generation(folder, expected_validity);
         if validity != 0 {
             let key = (folder.to_string(), uid, validity);
             if let Some(index) = self.raw_cache.iter().position(|(k, _)| *k == key) {
@@ -287,7 +299,7 @@ impl Server {
                 let mark = req.get("mark").and_then(Value::as_bool).unwrap_or(true);
                 let validity = optional_u32(req, "uidvalidity");
                 let raw = self.raw(&folder, uid, mark, validity)?;
-                let observed = self.session()?.mailbox.uidvalidity();
+                let observed = self.generation(&folder, validity);
                 Ok(stamp_validity(
                     json!(message::render(&raw, uid, false)),
                     observed,
@@ -400,11 +412,12 @@ impl Server {
             Ok(u) => u,
             Err(e) => return Some(Err(e)),
         };
-        let raw = match self.raw(&folder, uid, false, optional_u32(req, "uidvalidity")) {
+        let validity = optional_u32(req, "uidvalidity");
+        let raw = match self.raw(&folder, uid, false, validity) {
             Ok(raw) => raw,
             Err(e) => return Some(Err(e)),
         };
-        let observed = self.session().map(|s| s.mailbox.uidvalidity()).unwrap_or(0);
+        let observed = self.generation(&folder, validity);
         let out = self.out.clone();
         std::thread::spawn(move || {
             let view = stamp_validity(json!(message::render(&raw, uid, true)), observed);
@@ -555,7 +568,8 @@ fn write_unique(dir: &std::path::Path, name: &str, bytes: &[u8]) -> std::io::Res
 /// SELECT) and then waits in IDLE. A refresh is sent after a wake (which may
 /// be a flag change made elsewhere) or when the counts moved since the last
 /// look: mail that arrived while not in IDLE, at startup or across a
-/// reconnect, is caught that way. The first round always refreshes once.
+/// reconnect, is caught that way. The first round only records the counts:
+/// the window loads its own list when it opens.
 fn spawn_idle(account: Account, password: String, out: Out, stop: Arc<AtomicBool>) {
     std::thread::spawn(move || {
         let mut mailbox = Mailbox::new(account, password);
