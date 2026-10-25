@@ -1,21 +1,49 @@
-<p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="share/logo-white.svg">
-    <img src="share/logo-black.svg" width="96" alt="Omamail">
-  </picture>
-</p>
+<div align="center">
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="share/logo-white.svg">
+  <img src="share/logo-black.svg" width="96" alt="Omamail logo">
+</picture>
 
 # Omamail
 
-Gmail in the [Omarchy](https://omarchy.org) shell: a keyboard-driven mail
-panel that follows your theme, with desktop notifications and one-click
-verification codes.
+**A light, keyboard-driven Gmail client for the Omarchy shell.**
+
+[![Version](https://img.shields.io/badge/version-1.1.2-blue)](manifest.json)
+[![Platform](https://img.shields.io/badge/platform-Omarchy-1793d1)](https://omarchy.org)
+[![Backend](https://img.shields.io/badge/backend-Rust-b7410e)](backend)
+[![License](https://img.shields.io/badge/license-MIT-lightgrey)](LICENSE)
 
 ![Omamail in Tokyo Night, Catppuccin Latte and Gruvbox](preview.png)
 
-<sub>Sample mail.</sub>
+<sub>Sample mail, from the demo mailbox.</sub>
 
-## Features
+</div>
+
+Omamail puts your Gmail inbox one key away on the Omarchy desktop. It is a
+mail panel built from the shell's own components, so it looks like part of
+your desktop in every theme, with desktop notifications for new mail and
+verification codes you copy with one click. The Rust backend is about 3 MB
+and uses about 7 MB of memory.
+
+## Contents
+
+- [Highlights](#highlights)
+- [Requirements](#requirements)
+- [Installation](#installation)
+- [Usage](#usage)
+- [Updates](#updates)
+- [Privacy and safety](#privacy-and-safety)
+- [Uninstall](#uninstall)
+- [Development](#development)
+- [License](#license)
+
+## Highlights
+
+| Verification codes | Compose and reply | Gmail search |
+|:---:|:---:|:---:|
+| ![A sign-in code mail in Rose Pine](docs/images/code.png) | ![Replying to a mail in Gruvbox](docs/images/compose.png) | ![Search results in Kanagawa](docs/images/search.png) |
+| A new mail with a one-time code shows the code in its notification; a click copies it. | `c` to compose, `r`, `a` and `f` to reply, reply all and forward; `Ctrl+Enter` sends. | `/` searches with Gmail's own syntax, such as `from:x has:attachment`. |
 
 - **Part of the shell.** Built from `omarchy-shell`'s own components and theme
   tokens, so colours, font and rounding change with the theme.
@@ -27,8 +55,8 @@ verification codes.
 - **Verification codes.** When a new mail carries a one-time code, the
   notification shows it and a click copies it. The copy is marked
   sensitive and stays out of clipboard history.
-- **Keyboard first.** Move with `j`/`k`, search with `/` (Gmail syntax),
-  compose with `c`. See [Keys](#keys).
+- **Keyboard first.** Move with `j`/`k`, search with `/`, compose with `c`.
+  See [Usage](#usage).
 - **Opens on the last list.** The newest 200 headers of each folder you
   open are kept in `~/.local/state/omamail/list.json` (readable only by
   you), so the list is there when the window opens and settles when Gmail
@@ -37,12 +65,19 @@ verification codes.
 - **Light.** A ~3 MB Rust backend using about 7 MB of RAM. Closing the
   window ends it; only the notification service keeps running.
 - **Careful with mail.** HTML is sanitized, remote images load only when
-  you ask, and attachments never overwrite a file or run as a program.
+  you ask, and attachments never overwrite a file or run as a program. See
+  [Privacy and safety](#privacy-and-safety).
 
-## Install
+## Requirements
 
-Needs Rust (`omarchy install dev-env rust`). Attaching files also needs
-zenity (`omarchy pkg add zenity`).
+| | |
+|---|---|
+| **Desktop** | [Omarchy](https://omarchy.org) with `omarchy-shell`. The panel is built from the shell's components, so other desktops need a port. |
+| **Account** | A Gmail account with 2-Step Verification and an [app password](https://myaccount.google.com/apppasswords). |
+| **Build** | Rust, installed with `omarchy install dev-env rust`. |
+| **Attachments** | zenity, to pick files to attach: `omarchy pkg add zenity`. |
+
+## Installation
 
 ```bash
 omarchy plugin add https://github.com/hajizadaravan/omamail.git --enable
@@ -53,6 +88,14 @@ omarchy plugin add https://github.com/hajizadaravan/omamail.git --enable
 `~/.local/lib/omamail/` and installs the launcher entry, the icon and the
 notification service.
 
+### Sign in
+
+Omamail signs in with a Gmail **app password**. Turn on 2-Step
+Verification, then create one at <https://myaccount.google.com/apppasswords>.
+The password is kept in the desktop keyring, never in a file.
+
+## Usage
+
 Open Omamail from the app launcher, or bind a key in
 `~/.config/hypr/bindings.lua` to:
 
@@ -60,33 +103,25 @@ Open Omamail from the app launcher, or bind a key in
 omarchy-shell shell toggle reavann.omamail '{}'
 ```
 
-### Sign in
-
-Omamail signs in with a Gmail **app password**. Turn on 2-Step
-Verification, then create one at <https://myaccount.google.com/apppasswords>.
-The password is kept in the desktop keyring, never in a file.
-
-## Keys
-
 | Key | Action |
 |---|---|
-| `j` / `k`, arrows | next / previous message (opens it) |
-| `J` / `K` | next / previous folder |
-| `Enter` | open the selected message |
-| `Space` / `Shift+Space` | scroll the message |
-| `/` | search (Gmail syntax: `from:x has:attachment`) |
-| `c` | compose |
-| `r` / `a` / `f` | reply / reply all / forward |
-| `e` | archive |
-| `#`, `Delete` | move to Trash |
-| `s` | star |
-| `u` | toggle read |
-| `i` | load remote images |
-| `R` | refresh |
-| `Esc` | clear search, then close |
-| `Ctrl+Enter` | send (composer) |
+| `j` / `k`, arrows | Next / previous message (opens it) |
+| `J` / `K` | Next / previous folder |
+| `Enter` | Open the selected message |
+| `Space` / `Shift+Space` | Scroll the message |
+| `/` | Search (Gmail syntax: `from:x has:attachment`) |
+| `c` | Compose |
+| `r` / `a` / `f` | Reply / reply all / forward |
+| `e` | Archive |
+| `#`, `Delete` | Move to Trash |
+| `s` | Star |
+| `u` | Toggle read |
+| `i` | Load remote images |
+| `R` | Refresh |
+| `Esc` | Clear search, then close |
+| `Ctrl+Enter` | Send (composer) |
 
-## Update
+## Updates
 
 Once a day a user timer checks for new commits and posts a notification
 listing them. Click it, or run:
@@ -105,19 +140,7 @@ touches the plugin folder. To turn it off for good:
 systemctl --user disable --now omamail-update-check.timer
 ```
 
-## Remove
-
-```bash
-systemctl --user disable --now omamail-watch.service omamail-update-check.timer
-omarchy plugin remove reavann.omamail
-rm -rf ~/.local/lib/omamail ~/.config/omamail ~/.cache/omamail ~/.local/state/omamail
-rm ~/.config/systemd/user/omamail-watch.service ~/.config/systemd/user/omamail-update-check.{service,timer} \
-   ~/.local/share/applications/omamail.desktop \
-   ~/.local/share/icons/hicolor/scalable/apps/omamail.svg
-secret-tool clear application omamail
-```
-
-## Privacy and permissions
+## Privacy and safety
 
 No root, no sudo, and nothing in your existing configuration changes besides
 enabling the plugin.
@@ -150,6 +173,18 @@ How mail is handled:
 - **Signing out** removes the password, the account settings, the service
   state and the saved headers. Cached images stay until you remove them.
 
+## Uninstall
+
+```bash
+systemctl --user disable --now omamail-watch.service omamail-update-check.timer
+omarchy plugin remove reavann.omamail
+rm -rf ~/.local/lib/omamail ~/.config/omamail ~/.cache/omamail ~/.local/state/omamail
+rm ~/.config/systemd/user/omamail-watch.service ~/.config/systemd/user/omamail-update-check.{service,timer} \
+   ~/.local/share/applications/omamail.desktop \
+   ~/.local/share/icons/hicolor/scalable/apps/omamail.svg
+secret-tool clear application omamail
+```
+
 ## Development
 
 ```
@@ -158,6 +193,7 @@ backend/                                         Rust: IMAP/SMTP, MIME, sanitize
 share/                                           launcher entry, icon, logo, systemd units
 install.sh, update.sh                            build and install; update
 tools/make-preview.sh                            regenerate preview.png
+docs/images/                                     README screenshots, from the demo mailbox
 ```
 
 From a checkout elsewhere, `./install.sh` builds the backend and copies the
@@ -172,8 +208,10 @@ omarchy restart shell
 
 The backend speaks one JSON object per line on stdio, for example
 `{"id":1,"cmd":"list","folder":"INBOX","before_uid":0}`; see
-`backend/src/server.rs`. Contributions: [CONTRIBUTING.md](CONTRIBUTING.md).
+`backend/src/server.rs`. The rules every change follows are in
+[AGENTS.md](AGENTS.md); how to report a bug or send a change is in
+[CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## License
 
-[MIT](LICENSE)
+[MIT](LICENSE). Omamail is not affiliated with, made or endorsed by Google.
