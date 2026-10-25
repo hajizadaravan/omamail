@@ -6,6 +6,8 @@
 # byte for byte as the form renders it: the marketplace bot rejects requests
 # whose headings differ. An open request from the same account is edited to
 # the new commit instead of opening another one; editing re-runs validation.
+# It is found by title prefix and Plugin ID, ignoring case and the CRLF line
+# endings GitHub's web editor saves.
 #
 # The marketplace only accepts the repository's current default-branch HEAD,
 # so push main before the tag. Fails when the commit is not that HEAD, or
@@ -91,8 +93,9 @@ if [[ ${DRY_RUN:-} == 1 ]]; then
 fi
 
 : "${GH_TOKEN:?add MARKETPLACE_TOKEN to the marketplace environment (see AGENTS.md)}"
-open=$(gh issue list -R "$marketplace" --author @me --state open --limit 100 --json number,body |
-  jq -r --arg id "$plugin_id" '[.[] | select((.title | startswith("[Verify]:")) and (.body | contains("### Plugin ID\n\n" + $id + "\n")))][0].number // empty')
+open=$(gh issue list -R "$marketplace" --author @me --state open --limit 100 --json number,title,body |
+  jq -r --arg id "$plugin_id" '[.[] | select(((.title // "") | ascii_downcase | startswith("[verify]:"))
+    and ((.body // "") | gsub("\r"; "") | contains("### Plugin ID\n\n" + $id + "\n")))][0].number // empty')
 if [[ -n $open ]]; then
   gh issue edit "$open" -R "$marketplace" --title "$title" --body "$body" >/dev/null
   echo "updated https://github.com/$marketplace/issues/$open to $commit"

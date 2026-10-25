@@ -9,7 +9,7 @@
 
 **A light, keyboard-driven Gmail client for the Omarchy shell.**
 
-[![Version](https://img.shields.io/badge/version-1.1.2-blue)](manifest.json)
+[![Version](https://img.shields.io/badge/version-1.1.3-blue)](manifest.json)
 [![Platform](https://img.shields.io/badge/platform-Omarchy-1793d1)](https://omarchy.org)
 [![Backend](https://img.shields.io/badge/backend-Rust-b7410e)](backend)
 [![License](https://img.shields.io/badge/license-MIT-lightgrey)](LICENSE)
