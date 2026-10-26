@@ -55,4 +55,8 @@ there: `omarchy plugin update` may `git reset --hard` it.
 - **Gmail is the latency floor:** it announces new mail over IMAP 10–50 s
   after delivery (measured; Thunderbird is the same). Don't chase 1–2 s.
 - Tests must not need a real account or Internet access.
+- **Review every change before committing:** run `/code-review` and
+  `/security-review` on the diff (other agents: an equivalent independent
+  review), fix each real finding or say why not, and list what both
+  reported in the PR body. Rerun them after fixing.
 - Commits: Conventional Commits, no AI attribution or `Co-Authored-By`.

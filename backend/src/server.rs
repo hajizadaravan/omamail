@@ -535,19 +535,18 @@ fn watcher(action: &str) {
 }
 
 /// Writes `bytes` as `name` in `dir`, picking "name (2).ext" etc. when taken.
-/// `create_new` means an existing file is never overwritten.
+/// `create_new` means an existing file is never overwritten. Linux caps a
+/// file name at 255 bytes, not characters, so a long stem is cut to fit.
 fn write_unique(dir: &std::path::Path, name: &str, bytes: &[u8]) -> std::io::Result<PathBuf> {
     std::fs::create_dir_all(dir)?;
+    // A name too long to fit keeps only a real (short) extension.
     let (stem, ext) = match name.rfind('.') {
-        Some(i) if i > 0 => (&name[..i], &name[i..]),
+        Some(i) if i > 0 && (name.len() - i <= 16 || name.len() <= NAME_MAX - 6) => (&name[..i], &name[i..]),
         _ => (name, ""),
     };
     for n in 1..1000 {
-        let candidate = if n == 1 {
-            dir.join(name)
-        } else {
-            dir.join(format!("{stem} ({n}){ext}"))
-        };
+        let suffix = if n == 1 { String::new() } else { format!(" ({n})") };
+        let candidate = dir.join(fit_name(stem, &suffix, ext));
         match std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -562,6 +561,24 @@ fn write_unique(dir: &std::path::Path, name: &str, bytes: &[u8]) -> std::io::Res
         }
     }
     Err(std::io::Error::other("too many files with that name"))
+}
+
+const NAME_MAX: usize = 255;
+
+/// `stem + suffix + ext`, with the stem cut to fit NAME_MAX bytes. A cut
+/// without an extension ends in "…", so it can never end in an extension
+/// from the middle of the name (an inner ".desktop" or ".pdf").
+fn fit_name(stem: &str, suffix: &str, ext: &str) -> String {
+    if stem.len() + suffix.len() + ext.len() <= NAME_MAX {
+        return format!("{stem}{suffix}{ext}");
+    }
+    let mark = if ext.is_empty() { "…" } else { "" };
+    let mut end = NAME_MAX.saturating_sub(suffix.len() + ext.len() + mark.len()).min(stem.len());
+    while !stem.is_char_boundary(end) {
+        end -= 1;
+    }
+    let stem = stem[..end].trim_end_matches(|c: char| c.is_whitespace() || c == '.');
+    format!("{stem}{mark}{suffix}{ext}")
 }
 
 /// Pushes "changed" for INBOX to the window. Each round looks at INBOX (one
@@ -713,5 +730,42 @@ mod tests {
         assert_eq!(c.file_name().unwrap(), ".hidden");
         assert_eq!(std::fs::read(&a).unwrap(), b"1");
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn long_names_fit_in_255_bytes() {
+        // 180 characters pass safe_filename but are 540 bytes in CJK.
+        let dir = std::env::temp_dir().join(format!("omamail-long-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let name = format!("{}.pdf", "報告".repeat(88));
+        let a = write_unique(&dir, &name, b"1").unwrap();
+        let b = write_unique(&dir, &name, b"2").unwrap();
+        let ascii = write_unique(&dir, &format!("{}.pdf", "a".repeat(300)), b"3").unwrap();
+        let tail = write_unique(&dir, &format!("{}x.pdf.{}", "報".repeat(80), "あ".repeat(6)), b"4").unwrap();
+        let tail = tail.file_name().unwrap().to_str().unwrap();
+        assert!(tail.len() <= 255 && tail.ends_with('…'), "{tail}");
+        let (a, b) = (a.file_name().unwrap().to_str().unwrap(), b.file_name().unwrap().to_str().unwrap());
+        assert!(a.len() <= 255 && a.ends_with("報.pdf"), "{} bytes: {a}", a.len());
+        assert!(b.len() <= 255 && b.ends_with("告 (2).pdf"), "{} bytes: {b}", b.len());
+        assert_eq!(ascii.file_name().unwrap(), format!("{}.pdf", "a".repeat(251)).as_str());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn cut_names_never_end_in_an_inner_extension() {
+        // The tail after the last dot is too long to be an extension, so the
+        // name is cut; it must not end in ".desktop" from the middle.
+        for pad in 0..12 {
+            let name = format!("{}{}x.pdf.{}", "a".repeat(pad), "報".repeat(80), "あ".repeat(6));
+            let cut = fit_name(&name, "", "");
+            assert!(cut.len() <= NAME_MAX && cut.ends_with('…'), "{cut}");
+            assert!(!safe_to_open(std::path::Path::new(&cut)), "{cut}");
+        }
+        assert_eq!(fit_name("report .pdf", "", ""), "report .pdf");
+        assert_eq!(fit_name(&"a ".repeat(200), "", ".pdf"), format!("{}.pdf", "a ".repeat(126).trim_end()));
+        // The cut lands right after an ideographic space, which is trimmed.
+        let wide = format!("abcde{}", "報\u{3000}".repeat(70));
+        assert_eq!(fit_name(&wide, "", ".pdf"), format!("abcde{}報.pdf", "報\u{3000}".repeat(40)));
+        assert_eq!(fit_name("Dr. Smith report", " (2)", ".verylongextension1"), "Dr. Smith report (2).verylongextension1");
     }
 }
