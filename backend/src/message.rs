@@ -111,30 +111,30 @@ pub fn render(raw: &[u8], uid: u32, load_images: bool) -> View {
     // KB of crafted nesting would stall the backend for minutes. Gmail clips
     // mail at 102 KB, so anything far above that is shown as text instead.
     let html_part = msg.html_bodies().find(|p| p.is_text_html()).filter(|p| p.len() <= MAX_HTML_BYTES);
-    let mut referenced: Vec<String> = Vec::new();
-    let (html, remote_images, images_loaded) = match html_part.and_then(|p| p.text_contents()) {
+    // Inline parts the reader shows are left out of the attachment list.
+    let (html, remote_images, images_loaded, shown) = match html_part.and_then(|p| p.text_contents()) {
         Some(source) => {
-            let inline = extract_inline_images(&msg, source, &mut referenced);
+            let inline = extract_inline_images(&msg, source);
             let first = clean_html(source, &inline, None);
             if load_images && !first.remote_images.is_empty() {
                 let fetched = images::fetch_all(&first.remote_images);
                 let second = clean_html(source, &inline, Some(&fetched));
-                (second.html, first.remote_images.len(), true)
+                (second.html, first.remote_images.len(), true, second.inline_shown)
             } else {
-                (first.html, first.remote_images.len(), false)
+                (first.html, first.remote_images.len(), false, first.inline_shown)
             }
         }
         None => {
             // body_text converts an HTML-only (or oversized HTML) body to text.
             let text = msg.body_text(0).map(|t| t.into_owned()).unwrap_or_default();
-            (text_to_html(&text), 0, false)
+            (text_to_html(&text), 0, false, vec![])
         }
     };
 
     let attachments = msg
         .attachments()
         .enumerate()
-        .filter(|(_, part)| !content_id(part).is_some_and(|id| referenced.contains(&id)))
+        .filter(|(_, part)| !content_id(part).is_some_and(|id| shown.contains(&id)))
         .map(|(index, part)| {
             let mime = mime_of(part);
             Attachment {
@@ -161,7 +161,7 @@ pub fn render(raw: &[u8], uid: u32, load_images: bool) -> View {
 }
 
 /// Writes `cid:`-referenced images to the cache so the reader can show them.
-fn extract_inline_images(msg: &Message, html: &str, referenced: &mut Vec<String>) -> HashMap<String, PathBuf> {
+fn extract_inline_images(msg: &Message, html: &str) -> HashMap<String, PathBuf> {
     let mut map = HashMap::new();
     if !html.to_ascii_lowercase().contains("cid:") {
         return map;
@@ -183,7 +183,6 @@ fn extract_inline_images(msg: &Message, html: &str, referenced: &mut Vec<String>
         if !path.exists() && crate::config::write_private(&path, bytes).is_err() {
             continue;
         }
-        referenced.push(id.clone());
         map.insert(id, path);
     }
     map
@@ -405,6 +404,31 @@ JVBERi0=\r\n\
         let view = render(mail.as_bytes(), 1, false);
         assert!(started.elapsed().as_secs() < 2, "took {:?}", started.elapsed());
         assert!(view.html.contains("Hello") && !view.html.contains("<b>"), "{}", &view.html[..200]);
+    }
+
+    #[test]
+    fn unreferenced_images_stay_attachments() {
+        // The HTML names a cid (a signature logo whose part is missing), and
+        // the attached photo carries a Content-ID it never references.
+        let mail = b"Subject: photos\r\n\
+MIME-Version: 1.0\r\n\
+Content-Type: multipart/mixed; boundary=b\r\n\
+\r\n\
+--b\r\n\
+Content-Type: text/html; charset=utf-8\r\n\
+\r\n\
+<p>See attached</p><img src=\"cid:logo@x\">\r\n\
+--b\r\n\
+Content-Type: image/jpeg\r\n\
+Content-ID: <photo@x>\r\n\
+Content-Disposition: attachment; filename=\"photo.jpg\"\r\n\
+Content-Transfer-Encoding: base64\r\n\
+\r\n\
+/9j/4AAQ\r\n\
+--b--\r\n";
+        let view = render(mail, 1, false);
+        let names: Vec<&str> = view.attachments.iter().map(|a| a.name.as_str()).collect();
+        assert_eq!(names, vec!["photo.jpg"]);
     }
 
     #[test]

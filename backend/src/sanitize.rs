@@ -29,6 +29,9 @@ pub struct Clean {
     pub html: String,
     /// Remote image URLs found, in document order, whether or not they were shown.
     pub remote_images: Vec<String>,
+    /// Keys of `inline` whose image is in `html`; the other parts are
+    /// attachments the reader should list.
+    pub inline_shown: Vec<String>,
 }
 
 /// `inline`: `cid:` reference (without the scheme) → file of the extracted part.
@@ -39,9 +42,11 @@ pub fn clean_html(
     remote: Option<&HashMap<String, PathBuf>>,
 ) -> Clean {
     let found: Arc<Mutex<Vec<String>>> = Arc::default();
-    let inline = Arc::new(inline.clone());
+    let by_cid = Arc::new(inline.clone());
     let remote = Arc::new(remote.cloned());
     let filter_found = Arc::clone(&found);
+    let resolved: Arc<Mutex<HashSet<String>>> = Arc::default();
+    let filter_resolved = Arc::clone(&resolved);
 
     let mut tag_attrs: HashMap<&str, HashSet<&str>> = HashMap::new();
     // Only attributes whose values the post-processing can trust: nothing
@@ -67,7 +72,12 @@ pub fn clean_html(
                 ("a", "href") => is_link(value).then_some(Cow::Borrowed(value)),
                 ("img", "src") => {
                     if let Some(cid) = strip_scheme(value, "cid:") {
-                        return inline.get(cid.trim_matches(['<', '>'])).map(|p| file_url(p).into());
+                        let cid = cid.trim_matches(['<', '>']);
+                        let path = by_cid.get(cid)?;
+                        if let Ok(mut set) = filter_resolved.lock() {
+                            set.insert(cid.to_string());
+                        }
+                        return Some(file_url(path).into());
                     }
                     if is_web(value) {
                         if let Ok(mut list) = filter_found.lock()
@@ -89,7 +99,14 @@ pub fn clean_html(
         });
     let cleaned = builder.clean(html).to_string();
     let remote_images = found.lock().map(|l| l.clone()).unwrap_or_default();
-    Clean { html: tidy(&fit_images(&remove_hidden(&cleaned))), remote_images }
+    let html = tidy(&fit_images(&remove_hidden(&cleaned)));
+    // Hidden elements and images that could not be sized are gone by now.
+    // Parts with equal bytes share a file, so the cid must also have been used.
+    let shown = image_sources(&html);
+    let resolved = resolved.lock().map(|s| s.clone()).unwrap_or_default();
+    let inline_shown =
+        resolved.into_iter().filter(|cid| inline.get(cid).is_some_and(|p| shown.contains(&file_url(p)))).collect();
+    Clean { html, remote_images, inline_shown }
 }
 
 /// Newsletters are built from dozens of nested layout tables, and Qt adds
@@ -528,6 +545,18 @@ fn fit_images(html: &str) -> String {
     out
 }
 
+/// `src` of every <img> in the final output (text is escaped there).
+fn image_sources(html: &str) -> HashSet<String> {
+    let mut out = HashSet::new();
+    let mut rest = html;
+    while let Some(start) = rest.find("<img") {
+        let end = rest[start..].find('>').map_or(rest.len(), |e| start + e + 1);
+        out.extend(attr(&rest[start..end], "src"));
+        rest = &rest[end..];
+    }
+    out
+}
+
 fn attr(tag: &str, name: &str) -> Option<String> {
     let needle = format!(" {name}=\"");
     let start = tag.find(&needle)? + needle.len();
@@ -651,9 +680,40 @@ mod tests {
         png.extend_from_slice(&[8, 6, 0, 0, 0, 0, 0, 0, 0]);
         std::fs::write(&path, &png).unwrap();
         let inline = HashMap::from([("logo@x".to_string(), path.clone())]);
-        let out = clean_html(r#"<img src="cid:logo@x" style="x" onerror="y">"#, &inline, None).html;
+        let clean = clean_html(r#"<img src="cid:logo@x" style="x" onerror="y">"#, &inline, None);
+        let out = clean.html;
         assert!(out.contains(r#"width="560" height="140""#), "{out}");
         assert!(out.contains("wide%20image.png"), "{out}");
+        assert_eq!(clean.inline_shown, vec!["logo@x"]);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn only_displayed_inline_images_count_as_shown() {
+        let dir = std::env::temp_dir().join(format!("omamail-shown-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut png = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 0, 0, 0, 13, b'I', b'H', b'D', b'R'];
+        png.extend_from_slice(&1u32.to_be_bytes());
+        png.extend_from_slice(&1u32.to_be_bytes());
+        png.extend_from_slice(&[8, 6, 0, 0, 0, 0, 0, 0, 0]);
+        let write = |name: &str, bytes: &[u8]| {
+            let path = dir.join(name);
+            std::fs::write(&path, bytes).unwrap();
+            path
+        };
+        let inline = HashMap::from([
+            ("logo@x".to_string(), write("logo.png", &png)),
+            ("hidden@x".to_string(), write("hidden.png", &png)),
+            ("broken@x".to_string(), write("broken.png", b"not an image")),
+            ("photo@x".to_string(), write("photo.png", &png)),
+            ("link@x".to_string(), write("link.png", &png)),
+            ("twin@x".to_string(), dir.join("logo.png")),
+        ]);
+        let html = r#"<img src="cid:logo@x"><div style="display:none"><img src="cid:hidden@x"></div>
+                      <img src="cid:broken@x"><a href="cid:link@x">cid:link@x</a>"#;
+        let mut shown = clean_html(html, &inline, None).inline_shown;
+        shown.sort();
+        assert_eq!(shown, vec!["logo@x"]);
         std::fs::remove_dir_all(dir).unwrap();
     }
 
