@@ -1,11 +1,8 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 64 64">
-  <mask id="cut" maskUnits="userSpaceOnUse" x="0" y="0" width="64" height="64">
-    <rect width="64" height="64" fill="#ffffff"/>
-    <rect x="40" y="8" width="20" height="20" fill="#000000"/>
-  </mask>
-  <g mask="url(#cut)" fill="none" stroke="#000000" stroke-width="4">
-    <rect x="10" y="18" width="40" height="32" stroke-linejoin="miter"/>
-    <path d="M10 18 L30 38 L50 18" stroke-linecap="butt" stroke-linejoin="miter"/>
-  </g>
-  <rect x="44" y="12" width="12" height="12" fill="#000000"/>
+<svg xmlns="http://www.w3.org/2000/svg" width="104" height="104" viewBox="0 0 13 13" shape-rendering="crispEdges">
+  <!-- The reavann frame around an envelope: 13x13 pixels in five hard bands, top to bottom. -->
+  <path fill="#3c3c3c" d="M0 0h13v1h-13zM0 1h1v2h-1zM12 1h1v2h-1z"/>
+  <path fill="#565656" d="M0 3h1v2h-1zM12 3h1v2h-1zM3 4h7v1h-7z"/>
+  <path fill="#6e6e6e" d="M0 5h1v3h-1zM3 5h1v1h-1zM5 5h3v1h-3zM9 5h1v1h-1zM12 5h1v3h-1zM3 6h2v1h-2zM6 6h1v1h-1zM8 6h2v1h-2zM3 7h3v1h-3zM7 7h3v1h-3z"/>
+  <path fill="#9c9c9c" d="M0 8h1v2h-1zM3 8h7v1h-7zM12 8h1v2h-1z"/>
+  <path fill="#c3c3c3" d="M0 10h1v2h-1zM12 10h1v2h-1zM0 12h9v1h-9zM10 12h3v1h-3z"/>
 </svg>

@@ -2,14 +2,14 @@
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="share/logo-white.svg">
-  <img src="share/logo-black.svg" width="96" alt="Omamail logo">
+  <img src="share/logo-black.svg" width="104" alt="Omamail logo">
 </picture>
 
 # Omamail
 
 **A light, keyboard-driven Gmail client for the Omarchy shell.**
 
-[![Version](https://img.shields.io/badge/version-1.1.4-blue)](manifest.json)
+[![Version](https://img.shields.io/badge/version-1.1.7-blue)](manifest.json)
 [![Platform](https://img.shields.io/badge/platform-Omarchy-1793d1)](https://omarchy.org)
 [![Backend](https://img.shields.io/badge/backend-Rust-b7410e)](backend)
 [![License](https://img.shields.io/badge/license-MIT-lightgrey)](LICENSE)
