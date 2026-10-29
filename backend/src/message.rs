@@ -71,7 +71,7 @@ fn part_bytes<'a>(raw: &'a [u8], part: &'a MessagePart) -> &'a [u8] {
 pub fn safe_filename(name: &str, fallback: &str) -> String {
     let base = name.rsplit(['/', '\\']).next().unwrap_or_default();
     let cleaned: String = base.chars().filter(|c| !c.is_control() && !is_format_char(*c)).collect();
-    let cleaned = cleaned.trim().trim_start_matches('.').trim();
+    let cleaned = cleaned.trim_start_matches(|c: char| c == '.' || c.is_whitespace()).trim_end();
     let cleaned: String = cleaned.chars().take(180).collect();
     if cleaned.is_empty() { fallback.to_string() } else { cleaned }
 }
@@ -438,6 +438,11 @@ Content-Transfer-Encoding: base64\r\n\
         assert_eq!(safe_filename("..", "f"), "f");
         assert_eq!(safe_filename("ok\u{0}name.pdf", "f"), "okname.pdf");
         assert_eq!(safe_filename("invoice\u{202E}fdp.exe", "f"), "invoicefdp.exe");
+        // Dots and spaces in turn: no pass may leave a hidden name behind.
+        assert_eq!(safe_filename(". .bashrc", "f"), "bashrc");
+        assert_eq!(safe_filename(" . . .profile ", "f"), "profile");
+        assert_eq!(safe_filename(". .", "f"), "f");
+        assert_eq!(safe_filename(".\u{3000}.config", "f"), "config");
         assert_eq!(prefixed("RE: x", "Re"), "RE: x");
     }
 }
