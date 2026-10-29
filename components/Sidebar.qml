@@ -137,5 +137,11 @@ Item {
       tooltipText: "Sign out"
       onClicked: root.app.confirmSignOut()
     }
+
+    Button {
+      iconText: Fmt.icons.about
+      tooltipText: "About (?)"
+      onClicked: root.app.showAbout()
+    }
   }
 }

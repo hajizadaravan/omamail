@@ -9,7 +9,7 @@
 
 **A light, keyboard-driven Gmail client for the Omarchy shell.**
 
-[![Version](https://img.shields.io/badge/version-1.1.7-blue)](manifest.json)
+[![Version](https://img.shields.io/badge/version-1.2.0-blue)](manifest.json)
 [![Platform](https://img.shields.io/badge/platform-Omarchy-1793d1)](https://omarchy.org)
 [![Backend](https://img.shields.io/badge/backend-Rust-b7410e)](backend)
 [![License](https://img.shields.io/badge/license-MIT-lightgrey)](LICENSE)
@@ -117,7 +117,9 @@ omarchy-shell shell toggle reavann.omamail '{}'
 | `s` | Star |
 | `u` | Toggle read |
 | `i` | Load remote images |
+| `z` | Undo the last archive or move (while the status bar offers it) |
 | `R` | Refresh |
+| `?` | About: version, author, source and license |
 | `Esc` | Clear search, then close |
 | `Ctrl+Enter` | Send (composer) |
 

@@ -125,9 +125,21 @@ Item {
 
   property string status: ""
   property string hoveredLink: ""
+  // The backend's id for the last move while it can be undone (z), else 0.
+  property int undoId: 0
+  // A message to select once the next list reply for `pendingSelectFolder`
+  // has it (after an undo).
+  property int pendingSelectUid: -1
+  property string pendingSelectFolder: ""
+  property int pendingSelectValidity: 0
+  property bool aboutOpen: false
+  property string version: ""
 
-  function flash(text) {
+  // `undo`: offer that move back for as long as the message shows.
+  function flash(text, undo) {
     status = text
+    undoId = undo || 0
+    statusTimer.interval = undoId ? 8000 : 4000
     statusTimer.restart()
   }
 
@@ -145,6 +157,7 @@ Item {
     backend.request("status", {}, function(ok, data) {
       if (!ok) { phase = "signin"; return }
       email = data.email || ""
+      version = data.version || ""
       if (data.configured) enterMail()
       else phase = "signin"
     })
@@ -259,9 +272,35 @@ Item {
       && a.fromName === b.fromName && a.timestamp === b.timestamp && a.attachment === b.attachment
   }
 
+  // A plain copy of a model row, to merge with new rows.
+  function rowAt(i) {
+    var r = messages.get(i)
+    return { uid: r.uid, fromName: r.fromName, fromEmail: r.fromEmail, subject: r.subject,
+      timestamp: r.timestamp, seen: r.seen, flagged: r.flagged, attachment: r.attachment }
+  }
+
+  // The lowest and highest UID loaded. Rows are shown by date, but pages
+  // are fetched by UID, so "older" and "newer" are asked of these.
+  function uidRange(rows) {
+    var lo = -1, hi = -1
+    for (var i = 0; i < rows.length; i++) {
+      if (lo < 0 || rows[i].uid < lo) lo = rows[i].uid
+      if (rows[i].uid > hi) hi = rows[i].uid
+    }
+    return { lo: lo, hi: hi }
+  }
+
+  function loadedRows() {
+    var rows = []
+    for (var i = 0; i < messages.count; i++) rows.push(rowAt(i))
+    return rows
+  }
+
   // Updates the model in place, so a refresh keeps the scroll position and
-  // only repaints rows that changed.
+  // only repaints rows that changed. Newest first by arrival time, like
+  // Gmail: mail moved back into a folder gets a new UID but keeps its date.
   function applyRows(rows) {
+    rows.sort(function(a, b) { return b.timestamp - a.timestamp || b.uid - a.uid })
     for (var i = 0; i < rows.length; i++) {
       if (i < messages.count) {
         if (!sameRow(messages.get(i), rows[i])) messages.set(i, rows[i])
@@ -289,6 +328,7 @@ Item {
     var token = ++listToken
     var fromServer = false
     if (reset) {
+      pendingSelectUid = -1
       messages.clear()
       total = 0
       selectedUid = -1
@@ -330,14 +370,12 @@ Item {
       // session already confirmed the mailbox, and the new page reaches them.
       var shownValidity = listValidity
       var confirmed = listLive
-      var overlaps = rows.length > 0 && messages.count > 0 && rows[rows.length - 1].uid <= messages.get(0).uid
+      var oldest = uidRange(rows).lo
+      var overlaps = rows.length > 0 && messages.count > 0 && oldest <= uidRange(loadedRows()).hi
       var sameMailbox = shownValidity !== 0 && data.uidvalidity === shownValidity
       if (!searching && !reset && confirmed && overlaps && sameMailbox) {
-        var oldest = rows[rows.length - 1].uid
         for (var j = 0; j < messages.count; j++) {
-          var row = messages.get(j)
-          if (row.uid < oldest) rows.push(flatten({ uid: row.uid, from: [{ name: row.fromName, email: row.fromEmail }],
-            subject: row.subject, timestamp: row.timestamp, seen: row.seen, flagged: row.flagged, attachment: row.attachment }))
+          if (messages.get(j).uid < oldest) rows.push(rowAt(j))
         }
       }
       applyRows(rows)
@@ -345,6 +383,13 @@ Item {
       if (data.uidvalidity) listValidity = data.uidvalidity
       listLive = true
       syncCursor()
+      if (pendingSelectUid >= 0 && !searching) {
+        // Only in the mailbox the UID came from: a rebuilt one reuses UIDs.
+        var restored = pendingSelectFolder === folder && data.uidvalidity === pendingSelectValidity
+          ? indexOfUid(pendingSelectUid) : -1
+        pendingSelectUid = -1
+        if (restored >= 0) select(restored)
+      }
     })
   }
 
@@ -353,7 +398,7 @@ Item {
     loadingList = true
     loadingMore = true
     var token = ++listToken
-    var before = messages.get(messages.count - 1).uid
+    var before = uidRange(loadedRows()).lo
     backend.request("list", { folder: folder, before_uid: before }, function(ok, data, code) {
       if (token !== listToken) return
       loadingList = false
@@ -363,10 +408,13 @@ Item {
       if (data.uidvalidity && listValidity !== 0 && data.uidvalidity !== listValidity) {
         return loadList(true)
       }
+      var rows = loadedRows()
       for (var i = 0; i < data.messages.length; i++) {
         var m = data.messages[i]
-        if (indexOfUid(m.uid) < 0) messages.append(flatten(m))
+        if (indexOfUid(m.uid) < 0) rows.push(flatten(m))
       }
+      applyRows(rows)
+      syncCursor()
       total = data.total
     })
   }
@@ -575,7 +623,42 @@ Item {
           syncCursor()
         }
       }
-      flash(role === "trash" ? "Moved to Trash" : role === "all" ? "Archived" : "Moved to Inbox")
+      var done = role === "trash" ? "Moved to Trash" : role === "all" ? "Archived" : "Moved to Inbox"
+      var undo = data && data.undo ? data.undo : 0
+      flash(undo ? done + " · z to undo" : done, undo)
+    })
+  }
+
+  // The moved message gets a new UID where it lands, so the list is asked
+  // for again rather than patched.
+  // Not over the composer: its Esc and Ctrl+Enter shortcuts would still fire.
+  function showAbout() {
+    if (phase !== "mail" || draft) return
+    aboutOpen = true
+    keySink.forceActiveFocus()
+  }
+
+  function undoLast() {
+    if (!undoId) return
+    var id = undoId
+    flash("Undoing…")
+    backend.request("undo", { undo: id }, function(ok, data, code) {
+      // "retry": the backend kept the move after a network error.
+      if (!ok && code === "retry") return flash(data + " · z to try again", id)
+      if (!ok) return handleError(data, code)
+      flash("Undone")
+      loadFolders()
+      // The reader may show it where it no longer is (a copy leaves it there).
+      if (!data.copied && view && viewFolder === data.from && data.moved && data.moved.indexOf(view.uid) >= 0) dropView()
+      if (data.folder !== folder && data.from !== folder) return
+      // Back where it was: select it again, as before it was moved. Search
+      // results are only refreshed.
+      if (query.length === 0 && data.folder === folder && data.uid && data.uidvalidity) {
+        pendingSelectUid = data.uid
+        pendingSelectFolder = folder
+        pendingSelectValidity = data.uidvalidity
+      }
+      loadList(false)
     })
   }
 
@@ -682,6 +765,10 @@ Item {
 
   function handleKey(event) {
     if (confirming) return confirmDialog.handleKey(event)
+    if (aboutOpen && phase === "mail") {
+      if (event.key === Qt.Key_Escape || event.key === Qt.Key_Question || event.key === Qt.Key_Return || event.key === Qt.Key_Enter) aboutOpen = false
+      return true
+    }
     if (phase !== "mail" || draft) {
       if (event.key === Qt.Key_Escape && phase !== "mail") { requestClose(); return true }
       return false
@@ -724,6 +811,8 @@ Item {
     case Qt.Key_S: toggleStar(); return true
     case Qt.Key_U: toggleSeen(); return true
     case Qt.Key_I: loadImages(); return true
+    case Qt.Key_Z: undoLast(); return true
+    case Qt.Key_Question: showAbout(); return true
     case Qt.Key_Escape:
       if (query.length > 0) search("")
       else requestClose()
@@ -741,7 +830,10 @@ Item {
   Timer {
     id: statusTimer
     interval: 4000
-    onTriggered: mailApp.status = ""
+    onTriggered: {
+      mailApp.status = ""
+      mailApp.undoId = 0
+    }
   }
 
   // Labels get no push from the server (IDLE watches INBOX only), and a
@@ -946,6 +1038,23 @@ Item {
           font.family: Style.font.family
           font.pixelSize: Style.font.caption
           text: mailApp.hoveredLink.length > 0 ? mailApp.hoveredLink : mailApp.status
+
+          MouseArea {
+            anchors.fill: parent
+            enabled: mailApp.undoId > 0
+            cursorShape: Qt.PointingHandCursor
+            onClicked: mailApp.undoLast()
+          }
+        }
+      }
+
+      About {
+        anchors.fill: parent
+        app: mailApp
+        opened: mailApp.aboutOpen && mailApp.phase === "mail" && !mailApp.draft
+        onClosed: {
+          mailApp.aboutOpen = false
+          mailApp.focusList()
         }
       }
 

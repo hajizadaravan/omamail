@@ -255,6 +255,123 @@ fn status_value(raw: &[u8], key: &str) -> Option<u32> {
         .ok()
 }
 
+/// Where moved messages landed: the target folder's UIDVALIDITY and the
+/// messages' UIDs there.
+#[derive(Debug, PartialEq)]
+pub struct Moved {
+    pub uidvalidity: u32,
+    pub uids: Vec<u32>,
+}
+
+/// Reads `* OK [COPYUID <validity> <from> <to>]` (RFC 4315) from a MOVE
+/// reply. Anything unexpected (no such line, sets of different sizes, a UID
+/// that was not asked for) gives None: no undo rather than a wrong one.
+fn copy_uid(raw: &[u8], asked: &[u32]) -> Option<Moved> {
+    const PREFIX: &str = "* OK [COPYUID ";
+    let text = String::from_utf8_lossy(raw);
+    let line = text.lines().find(|l| {
+        l.get(..PREFIX.len())
+            .is_some_and(|p| p.eq_ignore_ascii_case(PREFIX))
+    })?;
+    let code = &line[PREFIX.len()..];
+    let code = &code[..code.find(']')?];
+    let mut parts = code.split(' ');
+    let uidvalidity: u32 = parts.next()?.parse().ok()?;
+    let from = expand_uids(parts.next()?, asked.len())?;
+    let to = expand_uids(parts.next()?, asked.len())?;
+    let sound = uidvalidity != 0
+        && parts.next().is_none()
+        && from.len() == to.len()
+        && from.iter().all(|u| asked.contains(u));
+    sound.then_some(Moved {
+        uidvalidity,
+        uids: to,
+    })
+}
+
+/// How to find moved messages in their new folder (see `Mailbox::landing`).
+enum Landing {
+    /// Their UIDs there, found before the move.
+    Known(Moved),
+    /// Their marks, and the target's UIDNEXT before the move.
+    Above(Vec<Mark>, u32),
+    Unknown,
+}
+
+/// What tells a message apart in another folder. The Message-ID finds it,
+/// but comes from the mail: it repeats, and HEADER search matches
+/// substrings. Every copy of the message also keeps its arrival time and
+/// size, which a namesake would have to match to the second and the byte.
+struct Mark {
+    id: String,
+    date: i64,
+    size: u32,
+}
+
+/// Search results checked against a mark; more is not a usable answer.
+const MARK_CANDIDATES: usize = 16;
+
+/// A candidate's UID, INTERNALDATE (Unix seconds) and RFC822.SIZE.
+type Seen = (u32, i64, u32);
+
+/// The one candidate that matches `mark`, if exactly one does.
+fn only_match(seen: &[Seen], mark: &Mark) -> Option<u32> {
+    let mut same: Vec<u32> = seen
+        .iter()
+        .filter(|(_, date, size)| *date == mark.date && *size == mark.size)
+        .map(|(uid, _, _)| *uid)
+        .collect();
+    same.sort_unstable();
+    same.dedup();
+    match same.as_slice() {
+        [uid] => Some(*uid),
+        _ => None,
+    }
+}
+
+/// The Message-ID from a `HEADER.FIELDS (MESSAGE-ID)` fetch. It comes from
+/// the mail, so only a plain `<...>` of printable ASCII is used: it goes
+/// back to the server in a SEARCH.
+fn message_id(header: &[u8]) -> Option<String> {
+    const NAME: &str = "message-id:";
+    let text = String::from_utf8_lossy(header)
+        .replace("\r\n ", " ")
+        .replace("\r\n\t", " ");
+    let line = text.lines().find(|l| {
+        l.get(..NAME.len())
+            .is_some_and(|n| n.eq_ignore_ascii_case(NAME))
+    })?;
+    let value = line[NAME.len()..].trim();
+    let plain = (3..=250).contains(&value.len())
+        && value.starts_with('<')
+        && value.ends_with('>')
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_graphic() && b != b'"' && b != b'\\');
+    plain.then(|| value.to_string())
+}
+
+/// The UIDs of a set such as `4:6,9`, or None for a malformed set or one
+/// with more than `max` UIDs (a range is never expanded past that).
+fn expand_uids(set: &str, max: usize) -> Option<Vec<u32>> {
+    let mut uids = Vec::new();
+    for part in set.split(',') {
+        let (a, b) = match part.split_once(':') {
+            Some((a, b)) => (a.parse::<u32>().ok()?, b.parse::<u32>().ok()?),
+            None => {
+                let n = part.parse::<u32>().ok()?;
+                (n, n)
+            }
+        };
+        let (lo, hi) = (a.min(b), a.max(b));
+        if lo == 0 || (hi - lo) as usize >= max.saturating_sub(uids.len()) {
+            return None;
+        }
+        uids.extend(lo..=hi);
+    }
+    Some(uids)
+}
+
 /// One IMAP connection. Not shared between threads: each thread owns its own.
 pub struct Mailbox {
     account: Account,
@@ -932,30 +1049,207 @@ impl Mailbox {
         })
     }
 
+    /// Moves messages to `dest`, returning where they landed when the
+    /// server says (COPYUID, with MOVE only): that is what an undo needs.
     pub fn move_to(
         &mut self,
         path: &str,
         uids: &[u32],
         dest: &str,
         expected_validity: u32,
-    ) -> MailResult<()> {
+    ) -> MailResult<Option<Moved>> {
         let set = uid_set(uids)?;
+        let target = quote(dest)?;
         self.run(|mb| {
             mb.select(path, false)?;
             mb.reject_reused_uids(expected_validity)?;
             if mb.has_capability("MOVE") {
-                mb.session()?.uid_mv(&set, dest)?;
-                return Ok(());
+                let landing = mb.landing(path, dest, &set, uids, expected_validity)?;
+                // imap 2.4's uid_mv drops the reply; COPYUID can be in it, on
+                // an untagged OK before the EXPUNGEs (RFC 6851).
+                let raw = mb
+                    .session()?
+                    .run_command_and_read_response(format!("UID MOVE {set} {target}"))?;
+                return Ok(mb.landed(&raw, uids, dest, landing));
             }
-            mb.session()?.uid_copy(&set, dest)?;
+            // uid_copy sends the name as given; "[Gmail]/All Mail" needs quotes.
+            mb.session()?.uid_copy(&set, &target)?;
             mb.session()?.uid_store(&set, "+FLAGS.SILENT (\\Deleted)")?;
             if mb.has_capability("UIDPLUS") {
                 mb.session()?.uid_expunge(&set)?;
             } else {
                 mb.session()?.expunge()?;
             }
-            Ok(())
+            Ok(None)
         })
+    }
+
+    /// Learns, before moving `uids` out of the selected `path`, how to find
+    /// them in `dest` afterwards (see `Mark`): in All Mail, which already
+    /// holds every message, by finding them there now; elsewhere, among the
+    /// messages that arrive with the move. Leaves `path` selected. Lookups
+    /// that fail only cost the undo.
+    fn landing(
+        &mut self,
+        path: &str,
+        dest: &str,
+        set: &str,
+        uids: &[u32],
+        expected_validity: u32,
+    ) -> MailResult<Landing> {
+        let marks = match self.marks(set, uids) {
+            Ok(marks) if !marks.is_empty() => marks,
+            Err(e) if e.is_connection() => return Err(e),
+            _ => return Ok(Landing::Unknown),
+        };
+        let all_mail = self
+            .folders
+            .as_ref()
+            .is_some_and(|fs| fs.iter().any(|f| f.path == dest && f.role == Some("all")));
+        let landing = if all_mail {
+            match self.find_by_mark(dest, &marks, 0) {
+                Ok(Some(moved)) => Landing::Known(moved),
+                Ok(None) | Err(MailError::Server(_)) => Landing::Unknown,
+                Err(e) => return Err(e),
+            }
+        } else {
+            match self.status(dest, "UIDNEXT") {
+                Ok(next) if next > 0 => Landing::Above(marks, next),
+                Ok(_) | Err(MailError::Server(_)) => Landing::Unknown,
+                Err(e) => return Err(e),
+            }
+        };
+        // The lookup above may have selected `dest`.
+        self.select(path, false)?;
+        self.reject_reused_uids(expected_validity)?;
+        // Still here after the lookup: a match was not a namesake that
+        // stood in for them while another client was removing them.
+        let present = self.session()?.uid_search(format!("UID {set}"))?;
+        if !uids.iter().all(|u| present.contains(u)) {
+            return Ok(Landing::Unknown);
+        }
+        Ok(landing)
+    }
+
+    /// The mark of each of `uids` in the selected folder, or an empty list
+    /// unless every one has a usable one. Only the first KB of the header is
+    /// read: it comes from the mail and may be any size.
+    fn marks(&mut self, set: &str, uids: &[u32]) -> MailResult<Vec<Mark>> {
+        let fetches = self.session()?.uid_fetch(
+            set,
+            "(UID INTERNALDATE RFC822.SIZE BODY.PEEK[HEADER.FIELDS (MESSAGE-ID)]<0.1024>)",
+        )?;
+        let mut marks: Vec<(u32, Mark)> = fetches
+            .iter()
+            .filter_map(|f| {
+                let uid = f.uid.filter(|u| uids.contains(u))?;
+                let mark = Mark {
+                    id: message_id(f.header()?)?,
+                    date: f.internal_date()?.timestamp(),
+                    size: f.size?,
+                };
+                Some((uid, mark))
+            })
+            .collect();
+        marks.sort_by_key(|(uid, _)| *uid);
+        marks.dedup_by_key(|(uid, _)| *uid);
+        Ok(if marks.len() == uids.len() {
+            marks.into_iter().map(|(_, m)| m).collect()
+        } else {
+            vec![]
+        })
+    }
+
+    /// The UIDs in `dest` of the marked messages, if each matches exactly
+    /// one message there at or above `floor`.
+    fn find_by_mark(
+        &mut self,
+        dest: &str,
+        marks: &[Mark],
+        floor: u32,
+    ) -> MailResult<Option<Moved>> {
+        if marks.is_empty() {
+            return Ok(None);
+        }
+        self.select(dest, true)?;
+        let mut uids = Vec::with_capacity(marks.len());
+        for mark in marks {
+            let found = self
+                .session()?
+                .uid_search(format!("HEADER Message-ID {}", quote(&mark.id)?))?;
+            let mut candidates: Vec<u32> = found.into_iter().filter(|u| *u >= floor).collect();
+            // A Message-ID shared this widely is no way to find one message.
+            if candidates.is_empty() || candidates.len() > MARK_CANDIDATES {
+                return Ok(None);
+            }
+            candidates.sort_unstable();
+            let fetches = self
+                .session()?
+                .uid_fetch(uid_set(&candidates)?, "(UID INTERNALDATE RFC822.SIZE)")?;
+            let seen: Vec<Seen> = fetches
+                .iter()
+                .filter_map(|f| {
+                    let uid = f.uid.filter(|u| candidates.contains(u))?;
+                    Some((uid, f.internal_date()?.timestamp(), f.size?))
+                })
+                .collect();
+            match only_match(&seen, mark) {
+                Some(uid) => uids.push(uid),
+                None => return Ok(None),
+            }
+        }
+        Ok(Some(Moved {
+            uidvalidity: self.uidvalidity,
+            uids,
+        }))
+    }
+
+    /// Copies messages to `dest`, returning where they landed when that can
+    /// be told, like `move_to`. In Gmail that adds `dest`'s label and leaves
+    /// the message where it was.
+    pub fn copy_to(
+        &mut self,
+        path: &str,
+        uids: &[u32],
+        dest: &str,
+        expected_validity: u32,
+    ) -> MailResult<Option<Moved>> {
+        let set = uid_set(uids)?;
+        let target = quote(dest)?;
+        self.run(|mb| {
+            mb.select(path, false)?;
+            mb.reject_reused_uids(expected_validity)?;
+            let landing = mb.landing(path, dest, &set, uids, expected_validity)?;
+            // uid_copy drops the reply too.
+            let raw = mb
+                .session()?
+                .run_command_and_read_response(format!("UID COPY {set} {target}"))?;
+            Ok(mb.landed(&raw, uids, dest, landing))
+        })
+    }
+
+    /// Where `uids` landed in `dest` after a MOVE or COPY whose untagged
+    /// reply was `raw`. They are already there, so a lookup that fails only
+    /// means not knowing.
+    fn landed(&mut self, raw: &[u8], uids: &[u32], dest: &str, landing: Landing) -> Option<Moved> {
+        if let Some(moved) = copy_uid(raw, uids) {
+            return Some(moved);
+        }
+        // Gmail sends COPYUID only on the tagged OK, which imap 2.4 strips.
+        let (marks, floor) = match landing {
+            Landing::Known(moved) => return Some(moved),
+            Landing::Above(marks, floor) => (marks, floor),
+            Landing::Unknown => return None,
+        };
+        match self.find_by_mark(dest, &marks, floor) {
+            Ok(found) => found,
+            Err(e) => {
+                if e.is_connection() {
+                    self.poison();
+                }
+                None
+            }
+        }
     }
 
     /// Waits in IDLE on the folder `poll_new` or `counts` just selected, until
@@ -1115,6 +1409,93 @@ mod tests {
         mb.selected = Some("INBOX".into());
         assert_eq!(mb.validity_if_selected("INBOX"), Some(4));
         assert_eq!(mb.validity_if_selected("Sent"), None);
+    }
+
+    #[test]
+    fn reads_where_moved_mail_landed() {
+        let raw = b"* OK [COPYUID 7 3,5:6 41:43] (Success)\r\n* 3 EXPUNGE\r\n";
+        assert_eq!(
+            copy_uid(raw, &[3, 5, 6]),
+            Some(Moved {
+                uidvalidity: 7,
+                uids: vec![41, 42, 43]
+            })
+        );
+        assert_eq!(
+            copy_uid(b"* OK [COPYUID 7 4:3 9:8]\r\n", &[3, 4]).map(|m| m.uids),
+            Some(vec![8, 9])
+        );
+    }
+
+    #[test]
+    fn a_doubtful_copyuid_offers_no_undo() {
+        // No COPYUID at all, or the tagged reply that imap 2.4 strips.
+        assert_eq!(copy_uid(b"* 3 EXPUNGE\r\n", &[3]), None);
+        // A UID that was not moved, or sets of different sizes.
+        assert_eq!(copy_uid(b"* OK [COPYUID 7 4 41]\r\n", &[3]), None);
+        assert_eq!(copy_uid(b"* OK [COPYUID 7 3,4 41]\r\n", &[3, 4]), None);
+        // A range wider than what was moved is never expanded.
+        assert_eq!(copy_uid(b"* OK [COPYUID 7 3 1:4294967295]\r\n", &[3]), None);
+        assert_eq!(copy_uid(b"* OK [COPYUID 0 3 41]\r\n", &[3]), None);
+        assert_eq!(copy_uid(b"* OK [COPYUID 7 3 x]\r\n", &[3]), None);
+    }
+
+    #[test]
+    fn a_message_id_match_must_be_the_moved_message() {
+        let mark = Mark {
+            id: "<a@b>".into(),
+            date: 1_700_000_000,
+            size: 5120,
+        };
+        assert_eq!(only_match(&[(41, 1_700_000_000, 5120)], &mark), Some(41));
+        // Namesakes: same Message-ID, but another arrival time or size.
+        assert_eq!(only_match(&[(7, 1_600_000_000, 5120)], &mark), None);
+        assert_eq!(only_match(&[(7, 1_700_000_000, 99)], &mark), None);
+        assert_eq!(
+            only_match(
+                &[(7, 1_600_000_000, 5120), (41, 1_700_000_000, 5120)],
+                &mark
+            ),
+            Some(41)
+        );
+        // The same FETCH twice (an unsolicited copy) is still one message.
+        assert_eq!(
+            only_match(
+                &[(41, 1_700_000_000, 5120), (41, 1_700_000_000, 5120)],
+                &mark
+            ),
+            Some(41)
+        );
+        // Two that match exactly cannot be told apart.
+        assert_eq!(
+            only_match(
+                &[(41, 1_700_000_000, 5120), (42, 1_700_000_000, 5120)],
+                &mark
+            ),
+            None
+        );
+        assert_eq!(only_match(&[], &mark), None);
+    }
+
+    #[test]
+    fn reads_message_ids_from_mail_safely() {
+        assert_eq!(
+            message_id(b"Message-ID: <a.1@mail.gmail.com>\r\n\r\n").as_deref(),
+            Some("<a.1@mail.gmail.com>")
+        );
+        // Any case, and folded onto the next line.
+        assert_eq!(
+            message_id(b"message-id:\r\n <x@y>\r\n").as_deref(),
+            Some("<x@y>")
+        );
+        assert_eq!(message_id(b"\r\n"), None);
+        assert_eq!(message_id(b"Message-ID: x@y\r\n"), None);
+        // Nothing that could leave the quoted SEARCH string.
+        assert_eq!(message_id(b"Message-ID: <a\"b@y>\r\n"), None);
+        assert_eq!(message_id(b"Message-ID: <a\\b@y>\r\n"), None);
+        assert_eq!(message_id(b"Message-ID: <a b@y>\r\n"), None);
+        assert_eq!(message_id("Message-ID: <ə@y>\r\n".as_bytes()), None);
+        assert_eq!(message_id("Mə: <x@y>\r\n".as_bytes()), None);
     }
 
     #[test]

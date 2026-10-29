@@ -248,7 +248,9 @@ pub fn dispatch(req: &Value) -> Option<Result<Value, String>> {
     let folder = req.get("folder").and_then(Value::as_str).unwrap_or("INBOX");
     let uid = req.get("uid").and_then(Value::as_u64).unwrap_or(0) as u32;
     Some(match cmd {
-        "status" => Ok(json!({"configured": true, "email": ME.1})),
+        "status" => {
+            Ok(json!({"configured": true, "email": ME.1, "version": env!("CARGO_PKG_VERSION")}))
+        }
         "folders" => Ok(json!(folders())),
         "unread" => Ok(json!(
             folders()
@@ -301,7 +303,7 @@ pub fn dispatch(req: &Value) -> Option<Result<Value, String>> {
                 .map(|d| json!(d))
                 .ok_or_else(|| "No such message".into())
         }
-        "flag" | "move" => Ok(Value::Null),
+        "flag" | "move" | "undo" => Ok(Value::Null),
         "login" | "logout" | "send" | "attachment" => Err("Not available in the demo build".into()),
         _ => return None,
     })

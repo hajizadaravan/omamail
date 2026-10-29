@@ -28,6 +28,8 @@ use std::time::{Duration, Instant};
 const PAGE_SIZE: u32 = crate::listcache::LIMIT as u32;
 const IDLE_TIMEOUT: Duration = Duration::from_secs(9 * 60);
 const RAW_CACHE: usize = 6;
+/// Shown in the window's About card.
+const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[derive(Clone)]
 struct Out(Arc<Mutex<std::io::Stdout>>);
@@ -127,6 +129,21 @@ struct Server {
     /// under. A rebuilt mailbox reuses UIDs, so a hit under another
     /// generation would show the wrong message.
     raw_cache: VecDeque<((String, u32, u32), Vec<u8>)>,
+    /// The last move, which `undo` can put back. Only the last one: the
+    /// window offers it for a few seconds, like Gmail.
+    undo: Option<Undo>,
+    undo_seq: u64,
+}
+
+/// Messages moved into `folder` as `uids`, and where they came from.
+struct Undo {
+    id: u64,
+    folder: String,
+    uids: Vec<u32>,
+    uidvalidity: u32,
+    back_to: String,
+    /// Put back with COPY, not MOVE (see `move_messages`).
+    copy: bool,
 }
 
 impl Server {
@@ -152,6 +169,7 @@ impl Server {
             s.mailbox.close();
         }
         self.raw_cache.clear();
+        self.undo = None;
     }
 
     fn session(&mut self) -> Result<&mut Session, Failure> {
@@ -245,9 +263,11 @@ impl Server {
     fn dispatch(&mut self, cmd: &str, req: &Value) -> Reply {
         match cmd {
             "status" => Ok(match &self.session {
-                Some(s) => json!({"configured": true, "email": s.account.email}),
+                Some(s) => {
+                    json!({"configured": true, "email": s.account.email, "version": VERSION})
+                }
                 None => {
-                    json!({"configured": false, "email": config::load_account().map(|a| a.email)})
+                    json!({"configured": false, "email": config::load_account().map(|a| a.email), "version": VERSION})
                 }
             }),
             "login" => self.login(req),
@@ -317,6 +337,7 @@ impl Server {
                 })
             }
             "move" => self.move_messages(req),
+            "undo" => self.undo_move(req),
             "attachment" => self.save_attachment(req),
             "draft" => {
                 let folder = str_arg(req, "folder")?.to_string();
@@ -372,10 +393,79 @@ impl Server {
             return Err(fail("The message is already there"));
         }
         let validity = optional_u32(req, "uidvalidity");
-        s.mailbox.move_to(&folder, &uids, &dest, validity)?;
+        let moved = s.mailbox.move_to(&folder, &uids, &dest, validity)?;
         self.raw_cache
             .retain(|((f, u, _), _)| !(f == &folder && uids.contains(u)));
-        Ok(Value::Null)
+        self.undo = moved.map(|m| {
+            self.undo_seq += 1;
+            Undo {
+                id: self.undo_seq,
+                folder: dest,
+                uids: m.uids,
+                uidvalidity: m.uidvalidity,
+                back_to: folder,
+                // All Mail holds every message, so moving one out of it would
+                // delete it (Gmail trashes or expunges it, per account
+                // setting). Copying it back re-adds the label it lost.
+                copy: role == "all",
+            }
+        });
+        Ok(json!({"undo": self.undo.as_ref().map(|u| u.id)}))
+    }
+
+    /// Puts the last move back, if `undo` still names it. Kept for another
+    /// try when the server could not be reached.
+    fn undo_move(&mut self, req: &Value) -> Reply {
+        let id = req
+            .get("undo")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| fail("missing undo"))?;
+        let undo = match self.undo.take() {
+            Some(u) if u.id == id => u,
+            other => {
+                self.undo = other;
+                return Err(fail("Nothing to undo"));
+            }
+        };
+        let mailbox = &mut self.session()?.mailbox;
+        let result = if undo.copy {
+            mailbox.copy_to(&undo.folder, &undo.uids, &undo.back_to, undo.uidvalidity)
+        } else {
+            mailbox.move_to(&undo.folder, &undo.uids, &undo.back_to, undo.uidvalidity)
+        };
+        let restored = match result {
+            Ok(restored) => restored,
+            Err(e) => {
+                // A retry is harmless even if this one got through: UIDs no
+                // longer in `folder` are skipped, and a second COPY adds a
+                // label the message already has.
+                if matches!(e, MailError::Offline(_) | MailError::Network(_)) {
+                    self.undo = Some(undo);
+                    // Tells the window this same id can be sent again.
+                    return Err(Failure {
+                        code: "retry",
+                        message: e.to_string(),
+                    });
+                }
+                return Err(e.into());
+            }
+        };
+        self.raw_cache
+            .retain(|((f, u, _), _)| !(f == &undo.folder && undo.uids.contains(u)));
+        // Its UID back in `back_to`, so the window can select it again, and
+        // the generation that UID belongs to.
+        let (uid, uidvalidity) = match restored {
+            Some(m) if m.uids.len() == 1 => (Some(m.uids[0]), m.uidvalidity),
+            _ => (None, 0),
+        };
+        Ok(json!({
+            "folder": undo.back_to,
+            "from": undo.folder,
+            "moved": undo.uids,
+            "copied": undo.copy,
+            "uid": uid,
+            "uidvalidity": uidvalidity,
+        }))
     }
 
     fn save_attachment(&mut self, req: &Value) -> Reply {
@@ -637,6 +727,8 @@ pub fn run() {
             out: worker_out.clone(),
             session: None,
             raw_cache: VecDeque::new(),
+            undo: None,
+            undo_seq: 0,
         };
         // The demo build answers from fixtures: no account, no connection.
         if let Some(account) = config::load_account().filter(|_| !cfg!(feature = "demo"))

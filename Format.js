@@ -25,6 +25,7 @@ var icons = {
   download: "\u{f01da}",
   open: "\u{f03cc}",
   logout: "\u{f0343}",
+  about: "\u{f02fd}",
   close: "\u{f0156}"
 }
 
