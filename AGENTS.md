@@ -13,12 +13,14 @@ cargo test --locked --features demo                          # if demo.rs or ser
 omarchy restart shell    # reload QML
 tools/make-preview.sh    # regenerate preview.png from the `demo` build (switches themes, restores them)
 git push origin main && git tag v1.2.3 && git push origin v1.2.3   # marketplace update request
+gh release create v1.2.3 --verify-tag --generate-notes --latest    # GitHub release, after every tag
 ```
 
 The tag must equal `manifest.json`'s version and point at main's HEAD (the
 marketplace accepts nothing else). `.github/workflows/marketplace.yml` then
 files the marketplace's verification request; a marketplace maintainer still
-approves it. It fails while the listing records an old repository path (after
+approves it. The workflow does not create a GitHub Release (its token is
+read-only); the `gh release create` step above does, so never skip it. It fails while the listing records an old repository path (after
 an account or repository rename) until a maintainer records the migration. It needs `MARKETPLACE_TOKEN` in the `marketplace` environment (only `v*`
 tags may deploy): a classic token with only `public_repo` and an expiry.
 Fine-grained tokens and `GITHUB_TOKEN` cannot open issues in another owner's
@@ -35,6 +37,10 @@ there: `omarchy plugin update` may `git reset --hard` it.
 - **Bump the version with every change on `main`** (semver), in
   `manifest.json`, `backend/Cargo.toml` and `backend/Cargo.lock` together.
   See CONTRIBUTING.md, "Versioning".
+- **Every version tag gets a GitHub Release.** Right after pushing
+  `vX.Y.Z`, run `gh release create vX.Y.Z --verify-tag --generate-notes
+  --latest` and check that it shows on the Releases page. A tag without a
+  release is an unfinished release.
 - **Builds are `--locked`.** Never run a plain `cargo update`; add crates
   only when necessary, with the lockfile change in the same commit.
 - **The app password stays in the keyring.** Never put it, mail text or
