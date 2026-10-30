@@ -78,4 +78,8 @@ there: `omarchy plugin update` may `git reset --hard` it.
   `/security-review` on the diff (other agents: an equivalent independent
   review), fix each real finding or say why not, and list what both
   reported in the PR body. Rerun them after fixing.
-- Commits: Conventional Commits, no AI attribution or `Co-Authored-By`.
+- **Commits: Conventional Commits only** (`docs(agents): …`,
+  `fix(reader): …`, `chore(release): …`), never a default message such as
+  "Update AGENTS.md" or "Bump version from …", including commits made in
+  the GitHub web editor (replace its suggested message). Squash-merge PRs
+  with a Conventional title. No AI attribution or `Co-Authored-By`.
