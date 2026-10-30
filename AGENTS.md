@@ -41,6 +41,19 @@ there: `omarchy plugin update` may `git reset --hard` it.
   `vX.Y.Z`, run `gh release create vX.Y.Z --verify-tag --generate-notes
   --latest` and check that it shows on the Releases page. A tag without a
   release is an unfinished release.
+- **A release is finished only when the marketplace has published it.**
+  After tagging, open the `[Verify]: Omamail vX.Y.Z` issue in
+  `omacom/omarchy-plugin-marketplace` and read every bot comment
+  (validation, security baseline). Fix what they report here and ship the
+  fix as a new patch release (bump, tag, `gh release create`): failed
+  checks, and capabilities the baseline flags only because of wording
+  (a README sentence saying the plugin needs no root was flagged as
+  `privilege`). Capabilities that
+  are real (`installer`, `service-management` for the user units) stay;
+  explain them on the issue if a maintainer asks. Keep checking the issue
+  until the update is published and the GitHub Release exists, and don't
+  report the work as done before then. If only a maintainer's approval is
+  left when you have to stop, say exactly that and link the issue.
 - **Builds are `--locked`.** Never run a plain `cargo update`; add crates
   only when necessary, with the lockfile change in the same commit.
 - **The app password stays in the keyring.** Never put it, mail text or
