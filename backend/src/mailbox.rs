@@ -162,7 +162,8 @@ pub fn people(address: Option<&Address>) -> Vec<Person> {
             a.iter()
                 .map(|addr| Person {
                     name: display_text(addr.name().unwrap_or_default()),
-                    email: addr.address().unwrap_or_default().to_string(),
+                    // Shown too, alone when there is no name.
+                    email: display_text(addr.address().unwrap_or_default()),
                 })
                 .collect()
         })
@@ -1383,6 +1384,18 @@ mod tests {
         assert!(fold("İş Təklifi NeuroBridge").contains(&fold("iş")));
         assert!(fold("NeuroBridge.SI").contains("neuro"));
         assert!(fold("Qızıl").contains(&fold("qizil")));
+    }
+
+    #[test]
+    fn sender_addresses_cannot_hide_their_domain() {
+        // Shown as is when there is no display name: the override would
+        // draw "ali\u{202E}moc.knab@evil.az" as "aliza.live@bank.com".
+        let header = "From: <ali\u{202E}moc.knab@evil.az>\r\n\
+                      To: Leyla <leyla\u{200B}@x.az>\r\n\r\n";
+        let parsed = MessageParser::new().parse_headers(header.as_bytes()).unwrap();
+        let from = people(parsed.from());
+        assert_eq!(from[0].email, "alimoc.knab@evil.az");
+        assert_eq!(people(parsed.to())[0].email, "leyla@x.az");
     }
 
     #[test]
