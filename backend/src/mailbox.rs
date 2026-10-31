@@ -153,7 +153,8 @@ pub fn display_text(text: &str) -> String {
 pub fn is_format_char(c: char) -> bool {
     matches!(c,
         '\u{00AD}' | '\u{061C}' | '\u{180E}' | '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}'
-        | '\u{2060}'..='\u{2069}' | '\u{FEFF}' | '\u{FFF9}'..='\u{FFFB}')
+        | '\u{2060}'..='\u{206F}' | '\u{FEFF}' | '\u{FFF9}'..='\u{FFFB}' | '\u{1BCA0}'..='\u{1BCA3}'
+        | '\u{1D173}'..='\u{1D17A}' | '\u{E0001}' | '\u{E0020}'..='\u{E007F}')
 }
 
 pub fn people(address: Option<&Address>) -> Vec<Person> {
@@ -1396,6 +1397,17 @@ mod tests {
         let from = people(parsed.from());
         assert_eq!(from[0].email, "alimoc.knab@evil.az");
         assert_eq!(people(parsed.to())[0].email, "leyla@x.az");
+    }
+
+    #[test]
+    fn invisible_format_characters_are_dropped() {
+        // Tag characters spell out hidden ASCII; these and the other
+        // format controls render as nothing, like the zero-width space.
+        let hidden = "pay\u{E0001}\u{E0041}\u{E007F}\u{206A}\u{206F}\u{1BCA0}\u{1BCA3}\u{1D173}\u{1D17A}pal.com";
+        assert_eq!(display_text(hidden), "paypal.com");
+        assert_eq!(crate::message::safe_filename("a\u{E0020}b.pdf", "f"), "ab.pdf");
+        // Visible text around them stays.
+        assert_eq!(display_text("Qızıl \u{2066}x\u{2069} 🙂"), "Qızıl x 🙂");
     }
 
     #[test]
